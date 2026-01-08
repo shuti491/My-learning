@@ -1,0 +1,436 @@
+#!/bin/bash
+
+# Offglide Conversational - Repository Setup Script
+# This script clones all required repositories into the parent directory
+
+set +e  # Don't exit on error - we want to process all repos
+
+# Default to SSH, can be overridden with --https flag
+USE_HTTPS=false
+
+# Parse command line arguments
+for arg in "$@"; do
+    case $arg in
+        --https)
+            USE_HTTPS=true
+            shift
+            ;;
+        --ssh)
+            USE_HTTPS=false
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --https    Clone repositories using HTTPS URLs"
+            echo "  --ssh      Clone repositories using SSH URLs (default)"
+            echo "  -h, --help Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
+# Get the script directory and parent directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARENT_DIR="$(dirname "${SCRIPT_DIR}")"
+
+# Source utility functions
+source "${SCRIPT_DIR}/util_scripts.sh"
+
+echo ""
+echo "=========================================="
+echo "  Offglide Conversational - Repository Setup"
+echo "=========================================="
+echo ""
+
+echo -e "${BLUE}Script directory: ${SCRIPT_DIR}${NC}"
+echo -e "${BLUE}Parent directory: ${PARENT_DIR}${NC}"
+if [ "$USE_HTTPS" = true ]; then
+    echo -e "${BLUE}Git protocol: HTTPS${NC}"
+else
+    echo -e "${BLUE}Git protocol: SSH${NC}"
+fi
+echo ""
+
+# Create og_override.properties from example if it doesn't exist
+setup_og_override_properties "${SCRIPT_DIR}" "false"
+
+# Read CHECKOUT_BRANCH from og_override.properties
+DEFAULT_BRANCH="master"
+if [ -f "${SCRIPT_DIR}/og_override.properties" ]; then
+    CHECKOUT_BRANCH=$(grep "^CHECKOUT_BRANCH=" "${SCRIPT_DIR}/og_override.properties" | cut -d'=' -f2)
+    if [ -n "$CHECKOUT_BRANCH" ]; then
+        echo -e "${GREEN}Using branch from og_override.properties: ${CHECKOUT_BRANCH}${NC}"
+    else
+        CHECKOUT_BRANCH="$DEFAULT_BRANCH"
+        echo -e "${YELLOW}No CHECKOUT_BRANCH found in og_override.properties, using default: ${DEFAULT_BRANCH}${NC}"
+    fi
+else
+    CHECKOUT_BRANCH="$DEFAULT_BRANCH"
+    echo -e "${YELLOW}og_override.properties not found, using default branch: ${DEFAULT_BRANCH}${NC}"
+fi
+echo ""
+
+# Repository configuration
+# Format: "repo_name|repo_path|branch"
+# repo_path is the org/repo part, URLs are constructed based on --https or --ssh flag
+REPO_CONFIGS=(
+    "commons-og|offglide-conversational/commons-og|${CHECKOUT_BRANCH}"
+    "lbf-client|offglide-conversational/lbf-client|${CHECKOUT_BRANCH}"
+    "agent-orchestrator|offglide-conversational/agent-orchestrator|${CHECKOUT_BRANCH}"
+    "central-cache-service|offglide-conversational/central-cache-service|${CHECKOUT_BRANCH}"
+    "conversation-server|offglide-conversational/conversation-server|${CHECKOUT_BRANCH}"
+    "observation|offglide-conversational/observation|${CHECKOUT_BRANCH}"
+    "mcp-server-og|offglide-conversational/mcp-server-og|${CHECKOUT_BRANCH}"
+
+)
+
+# Git host
+GIT_HOST="code.devsnc.com"
+
+# Function to construct git URL based on protocol
+get_git_url() {
+    local repo_path=$1
+    if [ "$USE_HTTPS" = true ]; then
+        echo "https://${GIT_HOST}/${repo_path}.git"
+    else
+        echo "git@${GIT_HOST}:${repo_path}.git"
+    fi
+}
+
+# Build REPOSITORIES array with proper URLs
+REPOSITORIES=()
+for config in "${REPO_CONFIGS[@]}"; do
+    IFS='|' read -r name repo_path branch <<< "$config"
+    url=$(get_git_url "$repo_path")
+    REPOSITORIES+=("${name}|${url}|${branch}")
+done
+
+# Function to print section headers
+print_header() {
+    echo ""
+    echo -e "${BLUE}=========================================="
+    echo -e " $1"
+    echo -e "==========================================${NC}"
+    echo ""
+}
+
+# Function to check if git is installed
+check_git() {
+    if ! command -v git &> /dev/null; then
+        echo -e "${RED} Git is not installed${NC}"
+        echo "Please install git and try again"
+        exit 1
+    fi
+    echo -e "${GREEN} Git is installed${NC}"
+}
+
+# Function to clone or update a repository
+clone_or_update_repo() {
+    local repo_name=$1
+    local repo_url=$2
+    local branch=$3
+    local target_dir="${PARENT_DIR}/${repo_name}"
+
+    echo -e "${BLUE}Processing repository: ${repo_name}${NC}"
+    echo -e "   URL: ${repo_url}"
+    echo -e "   Branch: ${branch}"
+    echo -e "   Target: ${target_dir}"
+    echo ""
+
+    if [ -d "${target_dir}" ]; then
+        echo -e "${YELLOW}  Directory ${repo_name} already exists${NC}"
+
+        # Check if it's a git repository
+        if [ -d "${target_dir}/.git" ]; then
+            echo -e "${BLUE}Updating existing repository...${NC}"
+            cd "${target_dir}"
+
+            # Fetch latest changes
+            if git fetch origin; then
+                echo -e "${GREEN} Fetched latest changes${NC}"
+            else
+                echo -e "${RED} Failed to fetch changes${NC}"
+                REPO_NAMES+=("${repo_name}")
+                REPO_STATUS+=("✗ Failed")
+                REPO_DETAILS+=("Failed to fetch changes")
+                return 1
+            fi
+
+            # Check current branch
+            current_branch=$(git rev-parse --abbrev-ref HEAD)
+            echo -e "   Current branch: ${current_branch}"
+
+            # Checkout target branch if different
+            if [ "${current_branch}" != "${branch}" ]; then
+                echo -e "${BLUE}Switching to branch ${branch}...${NC}"
+                if git checkout "${branch}"; then
+                    echo -e "${GREEN} Switched to branch ${branch}${NC}"
+                else
+                    echo -e "${RED} Failed to switch to branch ${branch}${NC}"
+                    REPO_NAMES+=("${repo_name}")
+                    REPO_STATUS+=("✗ Failed")
+                    REPO_DETAILS+=("Failed to switch to ${branch}")
+                    return 1
+                fi
+            fi
+
+            # Pull latest changes
+            echo -e "${BLUE}Pulling latest changes...${NC}"
+            if git pull origin "${branch}"; then
+                echo -e "${GREEN} Repository ${repo_name} updated successfully${NC}"
+                REPO_NAMES+=("${repo_name}")
+                REPO_STATUS+=("✓ Updated")
+                REPO_DETAILS+=("Pulled latest from ${branch}")
+            else
+                echo -e "${YELLOW}  Pull failed - repository may have local changes${NC}"
+                echo -e "${YELLOW}   Run 'git status' in ${target_dir} to check${NC}"
+                REPO_NAMES+=("${repo_name}")
+                REPO_STATUS+=("⚠ Warning")
+                REPO_DETAILS+=("Pull failed - may have local changes")
+            fi
+        else
+            echo -e "${RED} Directory exists but is not a git repository${NC}"
+            echo -e "${YELLOW}   Please remove or rename ${target_dir} and try again${NC}"
+            REPO_NAMES+=("${repo_name}")
+            REPO_STATUS+=("✗ Failed")
+            REPO_DETAILS+=("Not a git repository")
+            return 1
+        fi
+    else
+        echo -e "${BLUE}Cloning repository...${NC}"
+        cd "${PARENT_DIR}"
+
+        if git clone -b "${branch}" "${repo_url}" "${repo_name}"; then
+            echo -e "${GREEN} Repository ${repo_name} cloned successfully${NC}"
+            REPO_NAMES+=("${repo_name}")
+            REPO_STATUS+=("✓ Cloned")
+            REPO_DETAILS+=("Cloned from ${branch}")
+        else
+            echo -e "${RED} Failed to clone repository${NC}"
+            REPO_NAMES+=("${repo_name}")
+            REPO_STATUS+=("✗ Failed")
+            REPO_DETAILS+=("Clone failed")
+            return 1
+        fi
+    fi
+
+    echo ""
+    return 0
+}
+
+# Function to display repository configuration prompt
+prompt_for_repo_config() {
+    echo -e "${YELLOW}=========================================="
+    echo -e " Repository Configuration Required"
+    echo -e "==========================================${NC}"
+    echo ""
+    echo "This script needs to know the Git URLs for your repositories."
+    echo "Please update the REPOSITORIES array in this script with your actual Git URLs."
+    echo ""
+    echo "Current configuration:"
+    for repo_config in "${REPOSITORIES[@]}"; do
+        IFS='|' read -r name url branch <<< "$repo_config"
+        echo "  • ${name}: ${url} (${branch})"
+    done
+    echo ""
+    echo -e "${YELLOW}To configure:${NC}"
+    echo "  1. Edit this script: ${SCRIPT_DIR}/1-clone-repositories.sh"
+    echo "  2. Update the REPOSITORIES array with your Git URLs"
+    echo "  3. Update the branch names if needed"
+    echo ""
+    echo -e "${BLUE}Continuing with current configuration...${NC}"
+    echo ""
+}
+
+# Arrays to track results
+declare -a REPO_NAMES
+declare -a REPO_STATUS
+declare -a REPO_DETAILS
+
+# Main execution
+print_header "Step 1: Validating Prerequisites"
+
+check_git
+echo ""
+
+# Check if repositories are configured
+has_placeholder=false
+for repo_config in "${REPOSITORIES[@]}"; do
+    IFS='|' read -r name url branch <<< "$repo_config"
+    if [[ $url == *"your-org"* ]]; then
+        has_placeholder=true
+        break
+    fi
+done
+
+if [ "$has_placeholder" = true ]; then
+    prompt_for_repo_config
+fi
+
+# Confirmation prompt
+echo ""
+echo -e "${BLUE}The following repositories will be processed:${NC}"
+echo ""
+printf "%-30s %-20s %-20s %-15s\n" "REPOSITORY" "WILL BE CLONED" "WILL BE UPDATED" "BRANCH"
+printf "%s\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+for repo_config in "${REPOSITORIES[@]}"; do
+    IFS='|' read -r name url branch <<< "$repo_config"
+    target_dir="${PARENT_DIR}/${name}"
+
+    if [ -d "${target_dir}" ]; then
+        # Directory exists - will be updated
+        clone_status="No"
+        update_status="Yes"
+        color="${YELLOW}"
+
+        # Get current branch if it's a git repository
+        if [ -d "${target_dir}/.git" ]; then
+            current_branch=$(cd "${target_dir}" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+            if [ -n "$current_branch" ]; then
+                display_branch="$current_branch"
+            else
+                display_branch="$branch"
+            fi
+        else
+            display_branch="(not a git repo)"
+        fi
+    else
+        # Directory doesn't exist - will be cloned
+        clone_status="Yes"
+        update_status="No"
+        color="${GREEN}"
+        display_branch="$branch"
+    fi
+
+    printf "${color}%-30s %-20s %-20s %-15s${NC}\n" "$name" "$clone_status" "$update_status" "$display_branch"
+done
+
+printf "%s\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo -e "${YELLOW}Press ENTER to proceed, or any other key to cancel${NC}"
+echo -n "> "
+read -n 1 -r user_confirmation
+echo ""
+
+# Check if user pressed anything other than ENTER (empty or newline)
+if [[ -n "$user_confirmation" ]] && [[ "$user_confirmation" != $'\n' ]]; then
+    echo ""
+    echo -e "${YELLOW}Setup cancelled by user.${NC}"
+    echo ""
+    echo -e "${BLUE}To proceed later, run: $0${NC}"
+    echo ""
+    exit 0
+fi
+
+echo ""
+echo -e "${GREEN}✓ Confirmed. Proceeding with repository setup...${NC}"
+echo ""
+
+print_header "Step 2: Cloning/Updating Repositories"
+
+# Track success/failure
+all_success=true
+
+for repo_config in "${REPOSITORIES[@]}"; do
+    IFS='|' read -r name url branch <<< "$repo_config"
+
+    if ! clone_or_update_repo "$name" "$url" "$branch"; then
+        all_success=false
+        echo -e "${RED}Failed to setup repository: ${name}${NC}"
+    fi
+done
+
+print_header "Setup Summary"
+
+# Display results in table format
+echo ""
+printf "%-30s %-15s %-50s\n" "REPOSITORY" "STATUS" "DETAILS"
+printf "%s\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Color mapping for status
+for i in "${!REPO_NAMES[@]}"; do
+    repo="${REPO_NAMES[$i]}"
+    status="${REPO_STATUS[$i]}"
+    details="${REPO_DETAILS[$i]}"
+
+    # Determine color based on status
+    if [[ "$status" == *"✓"* ]]; then
+        color="${GREEN}"
+    elif [[ "$status" == *"⚠"* ]]; then
+        color="${YELLOW}"
+    else
+        color="${RED}"
+    fi
+
+    printf "${color}%-30s %-15s %-50s${NC}\n" "$repo" "$status" "$details"
+done
+
+printf "%s\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Count results by status
+success_count=$(printf '%s\n' "${REPO_STATUS[@]}" | grep -c "✓" || true)
+warning_count=$(printf '%s\n' "${REPO_STATUS[@]}" | grep -c "⚠" || true)
+failed_count=$(printf '%s\n' "${REPO_STATUS[@]}" | grep -c "✗" || true)
+
+echo -e "${BLUE}Summary:${NC}"
+echo -e "  ${GREEN}Success: ${success_count}${NC}"
+echo -e "  ${YELLOW}Warnings: ${warning_count}${NC}"
+echo -e "  ${RED}Failed: ${failed_count}${NC}"
+echo -e "  ${BLUE}Total: ${#REPO_NAMES[@]}${NC}"
+echo ""
+
+if [ "$all_success" = true ]; then
+    echo -e "${GREEN}✓ All repositories have been set up successfully!${NC}"
+    echo ""
+    echo "Repository structure:"
+    echo "  ${PARENT_DIR}/"
+    echo "  ├── offglide-services-setup/     (this setup repo)"
+    echo "  ├── commons-og/                  (shared library)"
+    echo "  ├── lbf-client/                  (web client)"
+    echo "  ├── agent-orchestrator/          (agent service)"
+    echo "  ├── central-cache-service/       (cache service)"
+    echo "  ├── conversation-server/         (backend service)"
+    echo "  ├── observation/                 (observation service)"
+    echo "  └── mcp-server-og/               (MCP server)"
+    echo ""
+    echo -e "${YELLOW}=========================================="
+    echo -e " IMPORTANT: Environment Setup Required"
+    echo -e "==========================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Before running Docker, please set up your local environment:${NC}"
+    echo ""
+    echo "   Knowledge Base Article: KB0523956"
+    echo "   Link: https://buildtools1.service-now.com/now/nav/ui/classic/params/target/kb_view.do%3Fsysparm_article%3DKB0523956"
+    echo ""
+    echo -e "${BLUE}Follow the instructions in KB0523956 to:${NC}"
+    echo "  • Configure required tools and dependencies"
+    echo "  • Set up proper environment variables"
+    echo "  • Ensure all prerequisites are met"
+    echo ""
+    echo -e "${GREEN}After completing the environment setup:${NC}"
+    echo "  1. Run build and deploy:"
+    echo "     cd ${SCRIPT_DIR}"
+    echo "     ./build-and-deploy.sh"
+    echo ""
+
+    # Display finish timestamp
+    END_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+    echo -e "${BLUE}Finished at: ${END_TIMESTAMP}${NC}"
+    echo ""
+    exit 0
+else
+    echo -e "${RED}✗ Some repositories failed to setup${NC}"
+    echo ""
+    echo "Please check the errors in the table above and try again"
+    echo ""
+
+    # Display finish timestamp
+    END_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+    echo -e "${BLUE}Finished at: ${END_TIMESTAMP}${NC}"
+    echo ""
+    exit 1
+fi
