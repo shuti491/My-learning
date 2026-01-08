@@ -1,0 +1,975 @@
+Build and deploy container file
+
+#!/usr/bin/env zsh
+
+# Offglide Conversational - Build and Deploy Script
+# This script builds all three components and deploys them via Docker Compose
+
+set -e  # Exit on any error
+
+# Get the script directory and parent directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARENT_DIR="$(dirname "${SCRIPT_DIR}")"
+
+# Source utility functions
+source "${SCRIPT_DIR}/util_scripts.sh"
+
+# Project directories (in parent directory)
+COMMONS_DIR="${PARENT_DIR}/commons-og"
+LBF_CLIENT_DIR="${PARENT_DIR}/lbf-client"
+AGENT_ORCHESTRATOR_DIR="${PARENT_DIR}/agent-orchestrator"
+CENTRAL_CACHE_SERVICE_DIR="${PARENT_DIR}/central-cache-service"
+OBSERVATION_SERVICE_DIR="${PARENT_DIR}/observation"
+CONVERSATION_SERVER_DIR="${PARENT_DIR}/conversation-server"
+MCP_SERVER_OG_DIR="${PARENT_DIR}/mcp-server-og"
+
+# Purge options
+PURGE_CONTAINERS=false
+PURGE_IMAGES=false
+FORCE_ENV=false
+SKIP_TESTS=false
+
+# Function to show usage
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help              Show this help message"
+    echo "  -p, --purge             Purge both containers and images before building"
+    echo "  -pc, --purge-containers Purge only containers before building"
+    echo "  -pi, --purge-images     Purge only images before building"
+    echo "  --forceenv              DELETE and recreate og_override.properties and .env files"
+    echo "  --skiptests             Skip tests for all projects during build"
+    echo ""
+    echo "Configuration:"
+    echo "  By default, if .env or pipeline.local.yaml exists, the script skips"
+    echo "  environment setup and proceeds directly to build."
+    echo ""
+    echo "  Use --forceenv to:"
+    echo "    1. DELETE and recreate og_override.properties from og_override.properties.example"
+    echo "    2. DELETE and recreate .env files from .env.example"
+    echo "    3. Apply properties from og_override.properties to all .env files"
+    echo "    4. Update application.properties for services with matching property prefixes"
+    echo "  WARNING: --forceenv will permanently delete existing configurations!"
+    echo ""
+    echo "  Repositories configured:"
+    echo "    - lbf-client (.env)"
+    echo "    - central-cache-service (.env, application.properties)"
+    echo "    - conversation-server (.env, application.properties)"
+    echo "    - observation (.env, application.properties)"
+    echo "    - mcp-server-og (.env)"
+    echo "    - agent-orchestrator (pipeline.yaml → pipeline.local.yaml)"
+    echo "    - commons-og (application.properties)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                      # Normal build and deploy (skip if .env exists)"
+    echo "  $0 --forceenv           # DELETE og_override.properties and .env files, then recreate from examples"
+    echo "  $0 --purge              # Remove containers and images, then build"
+    echo "  $0 --purge --forceenv   # Full clean rebuild with fresh environment files"
+    echo "  $0 --skiptests          # Build and deploy, skipping tests for all projects"
+    echo "  $0 --purge --skiptests  # Remove containers and images, then build without tests"
+    echo ""
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_usage
+            ;;
+        -p|--purge)
+            PURGE_CONTAINERS=true
+            PURGE_IMAGES=true
+            shift
+            ;;
+        -pc|--purge-containers)
+            PURGE_CONTAINERS=true
+            shift
+            ;;
+        -pi|--purge-images)
+            PURGE_IMAGES=true
+            shift
+            ;;
+        --forceenv)
+            FORCE_ENV=true
+            shift
+            ;;
+        --skiptests)
+            SKIP_TESTS=true
+            shift
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            show_usage
+            ;;
+    esac
+done
+
+# Setup og_override.properties if it doesn't exist
+OVERRIDE_FILE="${SCRIPT_DIR}/og_override.properties"
+
+# If --forceenv is set and og_override.properties exists, delete it
+if [ "$FORCE_ENV" = true ] && [ -f "${OVERRIDE_FILE}" ]; then
+    echo -e "${RED}Deleting existing og_override.properties (--forceenv flag is set)${NC}"
+    rm -f "${OVERRIDE_FILE}"
+    echo -e "${GREEN}✓ Deleted og_override.properties${NC}"
+    echo ""
+fi
+
+# Setup og_override.properties with interactive prompts
+if ! setup_og_override_properties "${SCRIPT_DIR}" "true"; then
+    echo -e "${BLUE}After updating, run:${NC}"
+    echo -e "  ./2-build-and-deploy.sh"
+    echo ""
+    exit 0
+fi
+
+echo ""
+echo "=========================================="
+echo "  Offglide Conversational - Build & Deploy"
+echo "=========================================="
+echo ""
+
+# Show options if enabled
+if [ "$PURGE_CONTAINERS" = true ] || [ "$PURGE_IMAGES" = true ] || [ "$FORCE_ENV" = true ] || [ "$SKIP_TESTS" = true ]; then
+    echo -e "${YELLOW}Options Enabled:${NC}"
+    if [ "$PURGE_CONTAINERS" = true ]; then
+        echo -e "${YELLOW}  - Containers will be removed${NC}"
+    fi
+    if [ "$PURGE_IMAGES" = true ]; then
+        echo -e "${YELLOW}  - Images will be removed${NC}"
+    fi
+    if [ "$FORCE_ENV" = true ]; then
+        echo -e "${YELLOW}  - og_override.properties will be DELETED and recreated from og_override.properties.example${NC}"
+        echo -e "${YELLOW}  - .env files will be DELETED and recreated from .env.example${NC}"
+        echo -e "${YELLOW}  - Properties from og_override.properties will be applied to .env files${NC}"
+        echo -e "${YELLOW}  - Service-specific properties will be applied to application.properties files${NC}"
+    fi
+    if [ "$SKIP_TESTS" = true ]; then
+        echo -e "${YELLOW}  - Tests will be skipped for all projects${NC}"
+    fi
+    echo ""
+fi
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Function to purge Docker containers
+purge_containers() {
+    print_header "Purging Docker Containers"
+
+    cd "${CONVERSATION_SERVER_DIR}"
+
+    echo -e "${BLUE}Listing containers to be removed...${NC}"
+    echo ""
+
+    # List running containers
+    if docker compose version >/dev/null 2>&1; then
+        RUNNING_CONTAINERS=$(docker compose ps -q 2>/dev/null || true)
+    else
+        RUNNING_CONTAINERS=$(docker-compose ps -q 2>/dev/null || true)
+    fi
+
+    if [ -n "$RUNNING_CONTAINERS" ]; then
+        echo -e "${YELLOW}Running containers:${NC}"
+        if docker compose version >/dev/null 2>&1; then
+            docker compose ps --format "table {{.Name}}\t{{.Service}}\t{{.Status}}\t{{.Ports}}"
+        else
+            docker-compose ps
+        fi
+        echo ""
+    else
+        echo -e "${YELLOW}No running containers found${NC}"
+        echo ""
+    fi
+
+    # List all containers (including stopped)
+    ALL_CONTAINERS=$(docker ps -a --filter "name=conversation-server\|agent-orchestrator\|central-cache-service\|lbf-client\|rabbitmq\|valkey" --format "{{.ID}}" 2>/dev/null || true)
+
+    if [ -n "$ALL_CONTAINERS" ]; then
+        echo -e "${YELLOW}All containers (including stopped):${NC}"
+        docker ps -a --filter "name=conversation-server\|agent-orchestrator\|central-cache-service\|lbf-client\|rabbitmq\|valkey" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+        echo ""
+    fi
+
+    echo -e "${BLUE}Stopping and removing containers (including volumes)...${NC}"
+
+    # Use docker compose (new) or docker-compose (legacy)
+    if docker compose version >/dev/null 2>&1; then
+        docker compose down -v
+    else
+        docker-compose down -v
+    fi
+
+    echo ""
+    echo -e "${GREEN} All containers and volumes removed successfully${NC}"
+}
+
+# Function to purge Docker images
+purge_images() {
+    print_header "Purging Docker Images"
+
+    # Define the images to remove
+    IMAGES=(
+        "lbf-client:latest"
+        "agent-orchestrator:latest"
+        "conversation-server:latest"
+        "central-cache-service:latest"
+    )
+
+    echo -e "${BLUE}Listing images to be removed...${NC}"
+    echo ""
+
+    # Check which images exist and list them
+    FOUND_IMAGES=()
+    echo -e "${YELLOW}Images found:${NC}"
+    echo ""
+    printf "%-40s %-20s %-15s %-15s\n" "REPOSITORY" "TAG" "IMAGE ID" "SIZE"
+    printf "%-40s %-20s %-15s %-15s\n" "----------" "---" "--------" "----"
+
+    for image in "${IMAGES[@]}"; do
+        if docker image inspect "$image" >/dev/null 2>&1; then
+            FOUND_IMAGES+=("$image")
+            # Get image details
+            IMAGE_INFO=$(docker images "$image" --format "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}" | head -n 1)
+            printf "%-40s %-20s %-15s %-15s\n" $IMAGE_INFO
+        fi
+    done
+
+    echo ""
+
+    if [ ${#FOUND_IMAGES[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No images found to remove${NC}"
+        return
+    fi
+
+    echo -e "${BLUE}Removing ${#FOUND_IMAGES[@]} Docker image(s)...${NC}"
+    echo ""
+
+    for image in "${FOUND_IMAGES[@]}"; do
+        echo -e "${BLUE}  Removing: $image${NC}"
+        docker rmi -f "$image"
+    done
+
+    echo ""
+    echo -e "${GREEN} Successfully removed ${#FOUND_IMAGES[@]} image(s)${NC}"
+}
+
+# Function to setup .env files and apply overrides
+setup_env_files() {
+    print_header "Setting Up Environment Files"
+
+    local OVERRIDE_FILE="${SCRIPT_DIR}/og_override.properties"
+
+    # Check if override file exists
+    if [ ! -f "${OVERRIDE_FILE}" ]; then
+        echo -e "${YELLOW}No og_override.properties file found, skipping overrides${NC}"
+        return
+    fi
+
+    echo -e "${BLUE}Reading overrides from: ${OVERRIDE_FILE}${NC}"
+    echo ""
+
+    # Read properties into associative array
+    declare -A OVERRIDES
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^#.*$ ]] && continue
+        [[ -z "$key" ]] && continue
+        # Trim whitespace
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+        OVERRIDES["$key"]="$value"
+    done < "$OVERRIDE_FILE"
+
+    # Display overrides
+    if (( ${#OVERRIDES} > 0 )); then
+        echo -e "${YELLOW}Properties to override:${NC}"
+        for key in "${(@k)OVERRIDES}"; do
+            # Mask sensitive values
+            if [[ "$key" =~ "(KEY|PASSWORD|SECRET|TOKEN)" ]]; then
+                echo "  $key=********"
+            else
+                echo "  $key=${OVERRIDES[$key]}"
+            fi
+        done
+        echo ""
+    else
+        echo -e "${YELLOW}No properties found in override file${NC}"
+        echo ""
+        return
+    fi
+
+    # Process each repository
+    setup_repo_env "lbf-client" "${LBF_CLIENT_DIR}"
+    setup_repo_env "central-cache-service" "${CENTRAL_CACHE_SERVICE_DIR}"
+    setup_repo_env "conversation-server" "${CONVERSATION_SERVER_DIR}"
+    setup_repo_env "observation" "${OBSERVATION_SERVICE_DIR}"
+    setup_repo_env "mcp-server-og" "${MCP_SERVER_OG_DIR}"
+
+    # Special handling for agent-orchestrator (YAML instead of .env)
+    setup_agent_orchestrator_yaml
+
+    # Update application.properties files for Spring Boot services
+    setup_application_properties "${SCRIPT_DIR}" "${COMMONS_DIR}" "${LBF_CLIENT_DIR}" "${AGENT_ORCHESTRATOR_DIR}" "${CENTRAL_CACHE_SERVICE_DIR}" "${OBSERVATION_SERVICE_DIR}" "${CONVERSATION_SERVER_DIR}" "${MCP_SERVER_OG_DIR}"
+}
+
+# Function to setup .env for a specific repo
+setup_repo_env() {
+    local REPO_NAME=$1
+    local REPO_DIR=$2
+
+    echo -e "${BLUE}Processing ${REPO_NAME}...${NC}"
+
+    local ENV_EXAMPLE="${REPO_DIR}/.env.example"
+    local ENV_FILE="${REPO_DIR}/.env"
+
+    # Check if .env.example exists
+    if [ ! -f "${ENV_EXAMPLE}" ]; then
+        echo -e "${YELLOW}  No .env.example found in ${REPO_NAME}, skipping${NC}"
+        echo ""
+        return
+    fi
+
+    # Check if .env already exists and --forceenv is not set
+    if [ -f "${ENV_FILE}" ] && [ "$FORCE_ENV" = false ]; then
+        echo -e "${GREEN}  .env already exists, skipping (use --forceenv to update)${NC}"
+        echo ""
+        return
+    fi
+
+    # If --forceenv is set and .env exists, delete it
+    if [ "$FORCE_ENV" = true ] && [ -f "${ENV_FILE}" ]; then
+        echo -e "${RED}  Deleting existing .env file${NC}"
+        rm -f "${ENV_FILE}"
+    fi
+
+    # Copy .env.example to .env
+    echo -e "${BLUE}  Creating .env from .env.example${NC}"
+    cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+
+    # Apply overrides - only if key exists in .env.example
+    local OVERRIDE_FILE="${SCRIPT_DIR}/og_override.properties"
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        [[ "$key" =~ ^#.*$ ]] && continue
+        [[ -z "$key" ]] && continue
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+
+        # Check if key exists in .env.example first (before we copied it)
+        if grep -q "^${key}=" "${ENV_EXAMPLE}" 2>/dev/null; then
+            echo -e "${BLUE}  Updating ${key}${NC}"
+            # Use | as delimiter to avoid issues with URLs and @ symbols
+            sed -i.bak "s|^${key}=.*|${key}=${value}|" "${ENV_FILE}"
+            rm -f "${ENV_FILE}.bak"
+        elif grep -q "^#${key}=" "${ENV_EXAMPLE}" 2>/dev/null; then
+            # If key is commented in .env.example, uncomment and set value
+            echo -e "${BLUE}  Uncommenting and setting ${key}${NC}"
+            sed -i.bak "s|^#${key}=.*|${key}=${value}|" "${ENV_FILE}"
+            rm -f "${ENV_FILE}.bak"
+        fi
+        # If key doesn't exist in .env.example, skip it (don't add it)
+    done < "$OVERRIDE_FILE"
+
+    echo -e "${GREEN}  ${REPO_NAME} .env file configured${NC}"
+    echo ""
+}
+
+# Function to setup agent-orchestrator YAML configuration
+setup_agent_orchestrator_yaml() {
+    echo -e "${BLUE}Processing agent-orchestrator (YAML configuration)...${NC}"
+
+    local YAML_SOURCE="${AGENT_ORCHESTRATOR_DIR}/va_agentic/configs/pipeline.yaml"
+    local YAML_LOCAL="${AGENT_ORCHESTRATOR_DIR}/va_agentic/configs/pipeline.local.yaml"
+
+    # Check if source YAML file exists
+    if [ ! -f "${YAML_SOURCE}" ]; then
+        echo -e "${YELLOW}  Source YAML file not found at: ${YAML_SOURCE}${NC}"
+        echo -e "${YELLOW}  Skipping agent-orchestrator configuration${NC}"
+        echo ""
+        return
+    fi
+
+    # Check if pipeline.local.yaml already exists and --forceenv is not set
+    if [ -f "${YAML_LOCAL}" ] && [ "$FORCE_ENV" = false ]; then
+        echo -e "${GREEN}  pipeline.local.yaml already exists, skipping (use --forceenv to update)${NC}"
+    else
+        # If --forceenv is set and pipeline.local.yaml exists, delete it
+        if [ "$FORCE_ENV" = true ] && [ -f "${YAML_LOCAL}" ]; then
+            echo -e "${RED}  Deleting existing pipeline.local.yaml${NC}"
+            rm -f "${YAML_LOCAL}"
+        fi
+
+        # Copy pipeline.yaml to pipeline.local.yaml
+        echo -e "${BLUE}  Creating pipeline.local.yaml from pipeline.yaml${NC}"
+        cp "${YAML_SOURCE}" "${YAML_LOCAL}"
+        echo -e "${GREEN}  Created pipeline.local.yaml${NC}"
+    fi
+
+    # Check if yq is installed for YAML manipulation
+    if command_exists yq; then
+        echo -e "${BLUE}  Using yq to update YAML configuration${NC}"
+
+        local OVERRIDE_FILE="${SCRIPT_DIR}/og_override.properties"
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ -z "$key" ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+
+            # Convert property key to YAML path (e.g., GPT_URL -> gpt.url)
+            # This is a simple conversion - may need customization based on actual YAML structure
+            local yaml_key=$(echo "$key" | tr '[:upper:]' '[:lower:]' | sed 's/_/./g')
+
+            echo -e "${BLUE}  Setting ${key} in pipeline.local.yaml${NC}"
+            yq eval ".${yaml_key} = \"${value}\"" -i "${YAML_LOCAL}"
+        done < "$OVERRIDE_FILE"
+
+        echo -e "${GREEN}  agent-orchestrator pipeline.local.yaml configured${NC}"
+    else
+        echo -e "${YELLOW}  yq not installed, performing manual YAML updates${NC}"
+
+        # Manual approach: replace values using sed (less robust but works without yq)
+        local OVERRIDE_FILE="${SCRIPT_DIR}/og_override.properties"
+
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ -z "$key" ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+
+            # Convert to lowercase with underscores (common YAML convention)
+            local yaml_key=$(echo "$key" | tr '[:upper:]' '[:lower:]')
+
+            # Try to find and replace the key in YAML format
+            # This assumes the YAML has format: key: value
+            # Use | as delimiter to avoid conflicts with @ in values
+            if grep -q "^[[:space:]]*${yaml_key}:" "${YAML_LOCAL}" 2>/dev/null; then
+                echo -e "${BLUE}  Updating ${key} in pipeline.local.yaml${NC}"
+                sed -i.tmp "s|^[[:space:]]*${yaml_key}:.*|${yaml_key}: ${value}|" "${YAML_LOCAL}"
+                rm -f "${YAML_LOCAL}.tmp"
+            fi
+        done < "$OVERRIDE_FILE"
+
+        echo -e "${GREEN}  agent-orchestrator pipeline.local.yaml configured (manual mode)${NC}"
+    fi
+
+    echo ""
+}
+
+# Validate required tools
+print_header "Validating Required Tools"
+
+if ! command_exists docker; then
+    echo -e "${RED} Docker is not installed${NC}"
+    exit 1
+fi
+echo -e "${GREEN} Docker is installed${NC}"
+
+if ! command_exists docker-compose && ! docker compose version >/dev/null 2>&1; then
+    echo -e "${RED} docker-compose or 'docker compose' is not installed${NC}"
+    exit 1
+fi
+echo -e "${GREEN} docker compose is installed${NC}"
+
+# Check for Java (required for Gradle)
+if ! command_exists java; then
+    echo -e "${RED} Java is not installed${NC}"
+    exit 1
+fi
+echo -e "${GREEN} Java is installed${NC}"
+
+# Check for make (required for agent-orchestrator)
+if ! command_exists make; then
+    echo -e "${RED} make is not installed${NC}"
+    exit 1
+fi
+echo -e "${GREEN} make is installed${NC}"
+
+# Validate required repositories exist
+print_header "Validating Required Repositories"
+
+if [ ! -d "${COMMONS_DIR}" ]; then
+    echo -e "${RED} commons-og repository not found at: ${COMMONS_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} commons-og repository found${NC}"
+
+if [ ! -d "${LBF_CLIENT_DIR}" ]; then
+    echo -e "${RED} lbf-client repository not found at: ${LBF_CLIENT_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} lbf-client repository found${NC}"
+
+if [ ! -d "${AGENT_ORCHESTRATOR_DIR}" ]; then
+    echo -e "${RED} agent-orchestrator repository not found at: ${AGENT_ORCHESTRATOR_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} agent-orchestrator repository found${NC}"
+
+if [ ! -d "${CENTRAL_CACHE_SERVICE_DIR}" ]; then
+    echo -e "${RED} central-cache-service repository not found at: ${CENTRAL_CACHE_SERVICE_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} central-cache-service repository found${NC}"
+
+if [ ! -d "${OBSERVATION_SERVICE_DIR}" ]; then
+    echo -e "${RED} observation repository not found at: ${OBSERVATION_SERVICE_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} observation repository found${NC}"
+
+if [ ! -d "${CONVERSATION_SERVER_DIR}" ]; then
+    echo -e "${RED} conversation-server repository not found at: ${CONVERSATION_SERVER_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} conversation-server repository found${NC}"
+
+if [ ! -d "${MCP_SERVER_OG_DIR}" ]; then
+    echo -e "${RED} mcp-server-og repository not found at: ${MCP_SERVER_OG_DIR}${NC}"
+    echo -e "${YELLOW}Run ./1-clone-repositories.sh to set up all repositories${NC}"
+    exit 1
+fi
+echo -e "${GREEN} mcp-server-og repository found${NC}"
+
+# Confirmation prompt
+print_header "Confirmation"
+
+echo -e "${BLUE}The following operations will be performed:${NC}"
+echo ""
+if [ "$PURGE_CONTAINERS" = true ]; then
+    echo -e "  ${YELLOW}• Remove all Docker containers${NC}"
+fi
+if [ "$PURGE_IMAGES" = true ]; then
+    echo -e "  ${YELLOW}• Remove all Docker images${NC}"
+fi
+if [ "$FORCE_ENV" = true ]; then
+    echo -e "  ${RED}• DELETE existing og_override.properties and recreate from og_override.properties.example${NC}"
+    echo -e "  ${RED}• DELETE existing .env files and recreate from .env.example${NC}"
+    echo -e "  ${BLUE}• Properties from og_override.properties will be applied to new .env files${NC}"
+    echo -e "  ${BLUE}• Service-specific properties (e.g., conversation-server.*) will be applied to application.properties${NC}"
+    echo -e "  ${RED}• WARNING: Any manual changes to og_override.properties, .env, and application.properties files will be lost!${NC}"
+fi
+if [ "$SKIP_TESTS" = true ]; then
+    echo -e "  ${BLUE}• Build commons (shared library) [tests will be skipped]${NC}"
+else
+    echo -e "  ${BLUE}• Build commons (shared library)${NC}"
+fi
+echo -e "  ${BLUE}• Build lbf-client Docker image${NC}"
+echo -e "  ${BLUE}• Build agent-orchestrator${NC}"
+if [ "$SKIP_TESTS" = true ]; then
+    echo -e "  ${BLUE}• Build central-cache-service [tests will be skipped]${NC}"
+    echo -e "  ${BLUE}• Build conversation-server [tests will be skipped]${NC}"
+else
+    echo -e "  ${BLUE}• Build central-cache-service${NC}"
+    echo -e "  ${BLUE}• Build conversation-server${NC}"
+fi
+echo -e "  ${BLUE}• Deploy all services with Docker Compose${NC}"
+echo -e "  ${BLUE}• Validate deployment${NC}"
+echo ""
+echo -e "${YELLOW}Press ENTER to proceed, or any other key to cancel${NC}"
+echo -n "> "
+read -k 1 user_confirmation
+echo ""
+
+# In zsh, ENTER produces a newline character (empty line)
+# Check if user pressed anything other than ENTER
+if [[ -n "$user_confirmation" ]] && [[ "$user_confirmation" != $'\n' ]]; then
+    echo ""
+    echo -e "${YELLOW}Build and deployment cancelled by user.${NC}"
+    echo ""
+    echo -e "${BLUE}To proceed later, run: $0${NC}"
+    echo ""
+    exit 0
+fi
+
+echo ""
+echo -e "${GREEN}✓ Confirmed. Proceeding with build and deployment...${NC}"
+echo ""
+
+# Execute purge operations if requested
+if [ "$PURGE_CONTAINERS" = true ]; then
+    purge_containers
+fi
+
+if [ "$PURGE_IMAGES" = true ]; then
+    purge_images
+fi
+
+# Setup .env files from .env.example and apply overrides from og_override.properties
+setup_env_files
+
+# Configure environment variables (check for GPT credentials)
+print_header "Validating GPT Configuration"
+
+ENV_FILE="${CONVERSATION_SERVER_DIR}/.env"
+ENV_EXAMPLE="${CONVERSATION_SERVER_DIR}/.env.example"
+
+# Function to check if a key has a valid value in .env
+check_env_key() {
+    local key=$1
+    local value=$(grep "^${key}=" "${ENV_FILE}" 2>/dev/null | cut -d'=' -f2-)
+
+    # Check if value is empty or is a placeholder
+    if [ -z "$value" ] || [[ "$value" == *"YOUR_API_KEY"* ]] || [[ "$value" == *"<"*">"* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Function to prompt for environment variables
+prompt_for_env_vars() {
+    echo ""
+    echo -e "${BLUE}Please provide the GPT configuration:${NC}"
+    echo ""
+
+    # zsh-compatible read
+    echo -n "GPT_URL: "
+    read gpt_url
+
+    if [ -z "$gpt_url" ]; then
+        echo -e "${RED} GPT_URL cannot be empty${NC}"
+        exit 1
+    fi
+
+    echo -n "GPT_KEY (API key): "
+    read -s gpt_key
+    echo  # Print newline after hidden input
+
+    if [ -z "$gpt_key" ]; then
+        echo -e "${RED} GPT_KEY cannot be empty${NC}"
+        exit 1
+    fi
+
+    # Copy .env.example and update with user values
+    echo -e "${BLUE}Updating .env file...${NC}"
+    if [ -f "${ENV_EXAMPLE}" ]; then
+        cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+        # Update GPT_URL and GPT_KEY in .env
+        sed -i.bak "s|^GPT_URL=.*|GPT_URL=${gpt_url}|" "${ENV_FILE}"
+        sed -i.bak "s|^GPT_KEY=.*|GPT_KEY=${gpt_key}|" "${ENV_FILE}"
+        rm -f "${ENV_FILE}.bak"
+        echo -e "${GREEN} .env file configured successfully${NC}"
+    else
+        echo -e "${RED} .env.example not found at: ${ENV_EXAMPLE}${NC}"
+        exit 1
+    fi
+}
+
+# Function to get value from og_override.properties
+get_override_value() {
+    local key=$1
+    local OVERRIDE_FILE="${SCRIPT_DIR}/og_override.properties"
+
+    if [ -f "${OVERRIDE_FILE}" ]; then
+        local value=$(grep "^${key}=" "${OVERRIDE_FILE}" 2>/dev/null | cut -d'=' -f2-)
+        echo "$value"
+    fi
+}
+
+# Check if GPT credentials are in og_override.properties first
+OVERRIDE_GPT_URL=$(get_override_value "GPT_URL")
+OVERRIDE_GPT_KEY=$(get_override_value "GPT_KEY")
+
+# Check if .env exists and has valid values
+if [ -f "${ENV_FILE}" ]; then
+    # Check if both GPT_URL and GPT_KEY have valid values
+    if check_env_key "GPT_URL" && check_env_key "GPT_KEY"; then
+        echo -e "${GREEN} .env file exists with GPT_URL and GPT_KEY configured${NC}"
+        echo -e "${BLUE}   Location: ${ENV_FILE}${NC}"
+    else
+        # Check if values are in og_override.properties
+        if [ -n "$OVERRIDE_GPT_URL" ] && [ -n "$OVERRIDE_GPT_KEY" ]; then
+            echo -e "${GREEN} Using GPT credentials from og_override.properties${NC}"
+            # Apply the values from og_override.properties
+            sed -i.bak "s|^GPT_URL=.*|GPT_URL=${OVERRIDE_GPT_URL}|" "${ENV_FILE}"
+            sed -i.bak "s|^GPT_KEY=.*|GPT_KEY=${OVERRIDE_GPT_KEY}|" "${ENV_FILE}"
+            rm -f "${ENV_FILE}.bak"
+            echo -e "${GREEN} GPT credentials configured from override file${NC}"
+        else
+            # .env exists but keys are missing and not in override file
+            echo -e "${YELLOW}  .env file exists but GPT credentials are not configured${NC}"
+            echo -e "${YELLOW}  GPT credentials not found in og_override.properties${NC}"
+            prompt_for_env_vars
+        fi
+    fi
+else
+    # .env doesn't exist, check override file first
+    if [ -n "$OVERRIDE_GPT_URL" ] && [ -n "$OVERRIDE_GPT_KEY" ]; then
+        echo -e "${GREEN} Using GPT credentials from og_override.properties${NC}"
+        # Copy .env.example and apply overrides
+        if [ -f "${ENV_EXAMPLE}" ]; then
+            cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+            sed -i.bak "s|^GPT_URL=.*|GPT_URL=${OVERRIDE_GPT_URL}|" "${ENV_FILE}"
+            sed -i.bak "s|^GPT_KEY=.*|GPT_KEY=${OVERRIDE_GPT_KEY}|" "${ENV_FILE}"
+            rm -f "${ENV_FILE}.bak"
+            echo -e "${GREEN} GPT credentials configured from override file${NC}"
+        fi
+    else
+        echo -e "${BLUE}No .env file found and no GPT credentials in og_override.properties${NC}"
+        prompt_for_env_vars
+    fi
+fi
+
+echo ""
+
+# Step 0: Build commons-og (shared library) if needed
+if [ -f "${COMMONS_DIR}/gradlew" ] || [ -f "${COMMONS_DIR}/build.gradle" ]; then
+    print_header "Step 0/7: Building commons-og (shared library) with Gradle"
+    cd "${COMMONS_DIR}"
+    echo -e "${BLUE}Running ./gradlew clean build...${NC}"
+    if [ "$SKIP_TESTS" = true ]; then
+        if [ -f "./gradlew" ]; then
+            ./gradlew clean build -x test --console=plain -q
+        else
+            gradle clean build -x test --console=plain -q
+        fi
+    else
+        if [ -f "./gradlew" ]; then
+            ./gradlew clean build --console=plain -q
+        else
+            gradle clean build --console=plain -q
+        fi
+    fi
+    echo -e "${GREEN} commons-og built successfully with Gradle${NC}"
+
+    echo -e "${BLUE}Publishing to local Maven repository...${NC}"
+    if [ "$SKIP_TESTS" = true ]; then
+        if [ -f "./gradlew" ]; then
+            ./gradlew publishToMavenLocal -x test --console=plain -q
+        else
+            gradle publishToMavenLocal -x test --console=plain -q
+        fi
+    else
+        if [ -f "./gradlew" ]; then
+            ./gradlew publishToMavenLocal --console=plain -q
+        else
+            gradle publishToMavenLocal --console=plain -q
+        fi
+    fi
+    echo -e "${GREEN} commons-og published to Maven local repository${NC}"
+else
+    echo -e "${YELLOW}Note: commons-og does not have Gradle build files, skipping build step${NC}"
+fi
+
+# Step 1: Build lbf-client Docker image
+print_header "Step 1/7: Building lbf-client Docker Image"
+cd "${LBF_CLIENT_DIR}"
+
+# Run setup.sh to ensure local environment is properly configured
+if [ -f "./setup.sh" ]; then
+    echo -e "${BLUE}Running setup.sh to configure local environment...${NC}"
+    # Run setup.sh with non-interactive mode (answer 'N' to all prompts)
+    # This ensures the build script doesn't get stuck waiting for user input
+    # If setup.sh fails, catch the error and continue (don't stop the build)
+    if echo -e "N\nN" | bash ./setup.sh 2>&1; then
+        echo -e "${GREEN} lbf-client local setup completed${NC}"
+    else
+        echo -e "${YELLOW}  Warning: setup.sh encountered errors but continuing with build${NC}"
+        echo -e "${YELLOW}  You may need to run setup.sh manually later if local development is needed${NC}"
+    fi
+else
+    echo -e "${YELLOW}  setup.sh not found, skipping local setup${NC}"
+fi
+
+echo -e "${BLUE}Building lbf-client:latest...${NC}"
+docker build -t lbf-client:latest .
+echo -e "${GREEN} lbf-client image built successfully${NC}"
+
+# Step 2: Build agent-orchestrator using Makefile
+print_header "Step 2/7: Building agent-orchestrator with Makefile"
+cd "${AGENT_ORCHESTRATOR_DIR}"
+# Setup git hooks for pre-commit and pre-push checks
+./setup-hooks.sh
+echo -e "${BLUE}Running make build...${NC}"
+make build
+echo -e "${GREEN} agent-orchestrator image built successfully${NC}"
+
+# Step 3: Build central-cache-service with Gradle
+print_header "Step 3/7: Building central-cache-service with Gradle"
+cd "${CENTRAL_CACHE_SERVICE_DIR}"
+echo -e "${BLUE}Running ./gradlew clean build...${NC}"
+if [ "$SKIP_TESTS" = true ]; then
+    ./gradlew clean build -x test --console=plain -q
+else
+    ./gradlew clean build --console=plain -q
+fi
+echo -e "${GREEN} central-cache-service built successfully with Gradle${NC}"
+
+# Step 4: Build observation service with Gradle
+print_header "Step 4/7: Building observation with Gradle"
+cd "${OBSERVATION_SERVICE_DIR}"
+echo -e "${BLUE}Running ./gradlew clean build...${NC}"
+if [ "$SKIP_TESTS" = true ]; then
+    ./gradlew clean build -x test --console=plain -q
+else
+    ./gradlew clean build --console=plain -q
+fi
+echo -e "${GREEN} observation built successfully with Gradle${NC}"
+
+
+# Step 5: Build conversation-server with Gradle
+print_header "Step 5/7: Building conversation-server with Gradle"
+cd "${CONVERSATION_SERVER_DIR}"
+echo -e "${BLUE}Running ./gradlew clean build...${NC}"
+if [ "$SKIP_TESTS" = true ]; then
+    ./gradlew clean build -x test --console=plain -q
+else
+    ./gradlew clean build --console=plain -q
+fi
+echo -e "${GREEN} conversation-server built successfully with Gradle${NC}"
+
+# Step 6: Build mcp-server-og using Makefile
+print_header "Step 6/7: Building mcp-server-og with Makefile"
+cd "${MCP_SERVER_OG_DIR}"
+echo -e "${BLUE}Running make build...${NC}"
+make build
+echo -e "${GREEN} mcp-server-og image built successfully${NC}"
+
+# Step 7: Deploy with Docker Compose
+print_header "Step 7/7: Deploying with Docker Compose"
+cd "${CONVERSATION_SERVER_DIR}"
+
+# Check if GPT credentials are configured
+if [ -n "$OVERRIDE_GPT_URL" ] && [ -n "$OVERRIDE_GPT_KEY" ]; then
+    echo -e "${GREEN}  GPT configuration loaded from og_override.properties:${NC}"
+    echo -e "${GREEN}  ✓ GPT_URL: ${OVERRIDE_GPT_URL}${NC}"
+    echo -e "${GREEN}  ✓ GPT_KEY: ********${NC}"
+else
+    echo -e "${YELLOW}  Make sure you have the required environment variables set:${NC}"
+    echo -e "${YELLOW}  - GPT_URL${NC}"
+    echo -e "${YELLOW}  - GPT_KEY${NC}"
+    echo -e "${BLUE}  (Add these to og_override.properties for automatic configuration)${NC}"
+fi
+echo ""
+
+echo -e "${BLUE}Starting all services with docker compose up -d --build...${NC}"
+
+# Use docker compose (new) or docker-compose (legacy)
+if docker compose version >/dev/null 2>&1; then
+    docker compose up -d --build
+else
+    docker-compose up -d --build
+fi
+
+echo -e "${GREEN} All services started${NC}"
+echo ""
+
+# Wait for services to be ready
+print_header "Waiting for Services to Start"
+echo -e "${BLUE}Waiting 30 seconds for services to initialize...${NC}"
+sleep 30
+
+# Validate services
+print_header "Validating Services"
+
+# Check RabbitMQ Management UI
+echo -e "${BLUE}Checking RabbitMQ Management UI (port 15674)...${NC}"
+if curl -f -s http://localhost:15674 > /dev/null; then
+    echo -e "${GREEN} RabbitMQ Management UI is accessible${NC}"
+else
+    echo -e "${YELLOW}  RabbitMQ Management UI may still be starting up${NC}"
+fi
+
+# Check conversation-server
+echo -e "${BLUE}Checking conversation-server (port 8040)...${NC}"
+if curl -f -s http://localhost:8040/actuator/health > /dev/null 2>&1 || curl -f -s http://localhost:8040 > /dev/null 2>&1; then
+    echo -e "${GREEN} conversation-server is accessible${NC}"
+else
+    echo -e "${YELLOW}  conversation-server may still be starting up${NC}"
+fi
+
+# Check agent-orchestrator
+echo -e "${BLUE}Checking agent-orchestrator (port 8050)...${NC}"
+if curl -f -s http://localhost:8050/health > /dev/null 2>&1 || curl -f -s http://localhost:8050 > /dev/null 2>&1; then
+    echo -e "${GREEN} agent-orchestrator is accessible${NC}"
+else
+    echo -e "${YELLOW}  agent-orchestrator may still be starting up${NC}"
+fi
+
+# Check central-cache-service
+echo -e "${BLUE}Checking central-cache-service (port 8090)...${NC}"
+if curl -f -s http://localhost:8090/api/cache/health > /dev/null 2>&1 || curl -f -s http://localhost:8090 > /dev/null 2>&1; then
+    echo -e "${GREEN} central-cache-service is accessible${NC}"
+else
+    echo -e "${YELLOW}  central-cache-service may still be starting up${NC}"
+fi
+
+# Check observation service
+echo -e "${BLUE}Checking observation (port 9050)...${NC}"
+if curl -f -s http://localhost:9050 > /dev/null 2>&1; then
+    echo -e "${GREEN} observation is accessible${NC}"
+else
+    echo -e "${YELLOW}  observation may still be starting up${NC}"
+fi
+
+# Check lbf-client (running on port 8060)
+echo -e "${BLUE}Checking lbf-client (port 8060)...${NC}"
+if curl -f -s http://localhost:8060 > /dev/null; then
+    echo -e "${GREEN} lbf-client is accessible at http://localhost:8060${NC}"
+else
+    echo -e "${YELLOW}  lbf-client may still be starting up${NC}"
+fi
+
+# Check mcp-server-og
+echo -e "${BLUE}Checking mcp-server-og (port 8030)...${NC}"
+if curl -f -s http://localhost:8030 > /dev/null 2>&1; then
+    echo -e "${GREEN} mcp-server-og is accessible${NC}"
+else
+    echo -e "${YELLOW}  mcp-server-og may still be starting up${NC}"
+fi
+
+echo ""
+
+# Summary
+print_header "Running Deployment Validation"
+cd "${SCRIPT_DIR}"
+
+if [ -f "./3-validate-deployment.sh" ]; then
+    echo -e "${BLUE}Running validation script...${NC}"
+    echo ""
+    ./3-validate-deployment.sh
+else
+    echo -e "${YELLOW}  Validation script not found, skipping validation${NC}"
+    echo ""
+    echo -e "${GREEN} All services have been started!${NC}"
+    echo ""
+    echo "Service URLs:"
+    echo "  • Web Client (lbf-client):         http://localhost:8060"
+    echo "  • Conversation Server:             http://localhost:8040"
+    echo "  • Agent Orchestrator:              http://localhost:8050"
+    echo "  • Agent Orchestrator API Docs:     http://localhost:8050/docs"
+    echo "  • Central Cache Service:           http://localhost:8090"
+    echo "  • Central Cache Service Health:    http://localhost:8090/api/cache/health"
+    echo "  • MCP Server:                      http://localhost:8030"
+    echo "  • RabbitMQ Management:             http://localhost:15674 (guest/guest)"
+    echo "  • Observation Service (REST):      http://localhost:9050"
+    echo "  • Observation Service (gRPC):      http://localhost:9060"
+    echo "  • Valkey (Redis):                  localhost:6381"
+    echo ""
+    echo "To view logs:"
+    echo "  cd ${CONVERSATION_SERVER_DIR}"
+    echo "  docker compose logs -f"
+    echo ""
+    echo "To stop all services:"
+    echo "  cd ${CONVERSATION_SERVER_DIR}"
+    echo "  docker compose down"
+    echo ""
+fi
+
+echo -e "${GREEN} Build and deployment complete!${NC}"
+echo ""
+
+# Display finish timestamp
+END_TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+echo -e "${BLUE}Finished at: ${END_TIMESTAMP}${NC}"
+echo ""
