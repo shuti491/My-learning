@@ -1,0 +1,183 @@
+User Authentication in OffGlide Conversational
+Let me explain how authentication is handled for logged-in users in the OffGlide system.
+
+Authentication Flow
+1. Token-Based Authentication (token_hashcode)
+The system uses a token hashcode mechanism to identify and authenticate users throughout the request lifecycle.
+
+From request_context.py:32-152:
+
+python
+# Context variable to store token_hashcode for current request
+_token_hashcode_context: ContextVar[Optional[str]] = ContextVar('token_hashcode', default="")
+
+def set_request_token_hashcode(token_hashcode: str) -> None:
+    """Set the token_hashcode for the current request context."""
+    _token_hashcode_context.set(token_hashcode)
+
+def get_request_token_hashcode() -> Optional[str]:
+    """Get the token_hashcode for the current request context."""
+    return _token_hashcode_context.get()
+Purpose: The token_hashcode is a unique identifier representing the authenticated user's session.
+
+Authentication Components
+2. Request Context Storage
+User authentication data is stored in request-scoped context variables (thread-local):
+
+From request_context.py:22-44:
+
+Context Variable	Purpose
+_token_hashcode_context	User session token
+_instance_id_context	ServiceNow instance ID
+_instance_url_context	ServiceNow instance URL
+_conversation_id_context	Current conversation ID
+Lifecycle: Set at request start → Available throughout pipeline → Cleared at request end
+
+3. JWT Token for Mosaic Integration
+For LLM calls via Mosaic, the system fetches JWT tokens using the token_hashcode.
+
+From request_auth_token.py:7-61:
+
+python
+def get_auth_token(
+    hashcode: str = "string",
+    instance_id: str = "string",
+    mosaic: bool = True,
+) -> str:
+    """Get auth token from chat service (sync version)."""
+    
+    # Check for local override token first (for LAB environment)
+    local_token = os.environ.get("LOCAL_TEMP_JWT_TOKEN_FOR_MOSAIC_LAB", "").strip()
+    if local_token:
+        return local_token
+
+    # Otherwise, fetch from JWT auth service
+    url = os.environ.get("JWT_AUTH_BASE_URL","http://localhost:8040")
+    api = os.environ.get("JWT_AUTH_API","/chat/auth/token")
+    
+    payload = {
+        "hashcode": hashcode,
+        "instanceid": instance_id,
+        "mosaic": mosaic,
+    }
+    
+    response = client.post(url + api, json=payload)
+    token = response.json()['mosaic']['jwt_token']
+    return token
+Flow:
+
+Agent orchestrator sends hashcode + instance_id to JWT auth service
+JWT auth service validates and returns JWT token
+JWT token used for Mosaic API calls
+4. ServiceNow Integration (Basic Auth)
+For ServiceNow API calls (tool execution), the system uses Basic Authentication.
+
+From glide_rest_api.py:35-54:
+
+python
+class GlideRestAPI:
+    def __init__(self, base_url: str = "http://localhost:8080", 
+                 username: str = "admin", 
+                 password: str = "admin"):
+        self.base_url = base_url
+        self.username = username
+        self.password = password
+        self._auth_header = self._create_auth_header()
+
+    def _create_auth_header(self) -> str:
+        """Create basic authentication header."""
+        auth_string = base64.b64encode(f"{self.username}:{self.password}".encode()).decode("ascii")
+        return f"Basic {auth_string}"
+Headers sent to ServiceNow:
+
+python
+headers = {
+    "Authorization": self._auth_header,  # Basic auth
+    "Content-Type": "application/json",
+}
+Complete Authentication Flow
+User Login → Request Processing
+1. User logs into ServiceNow
+    ↓
+2. Conversation Server creates session with token_hashcode
+    ↓
+3. CS sends request to Agent Orchestrator with:
+   - meta.instanceId
+   - meta.conversationId  
+   - token_hashcode (in payload/headers)
+    ↓
+4. Agent Orchestrator receives request
+    ↓
+5. CSAgenticProtocolHandler extracts authentication data:
+   - instance_id from meta
+   - token_hashcode from payload
+    ↓
+6. Store in request context:
+   set_request_instance_id(instance_id)
+   set_request_token_hashcode(token_hashcode)
+   set_request_instance_url(instance_url)
+    ↓
+7. Throughout pipeline execution:
+   - Mosaic calls: Use JWT token (fetched via token_hashcode)
+   - ServiceNow calls: Use Basic Auth (admin credentials)
+   - Cache operations: Scoped by instance_id
+    ↓
+8. Request completes → clear_request_context()
+User Context in Tool Execution
+User-Scoped Operations
+Tools execute in the context of the logged-in user:
+
+From glide_rest_api.py:206-238:
+
+python
+async def execute_tool(
+    self,
+    tool_m2m_id: str | None = None,
+    inputs: dict = None,
+    meta: dict = None,
+    execution_mode: GlideToolExecutionMode = GlideToolExecutionMode.SYNC
+) -> dict:
+    
+    payload_dict = {
+        "inputs": inputs,
+        "executionMode": execution_mode.value,
+        "toolM2mId": tool_m2m_id,
+        "meta": self._enrich_meta_with_execution_context(meta)
+    }
+    
+    # Execute via MCP server with user context
+    return await execute_request_via_mcp(self._mcp_server_url, payload_dict)
+User context includes:
+
+pod_ip - Agent orchestrator pod IP
+callback_url - Callback URL for async responses
+User session information (passed through meta)
+Security Considerations
+Multi-Tenancy & Isolation
+Instance Scoping: All cache operations scoped by instance_id
+python
+cache_key = f"{instance_id}:{conversation_id}_skills"
+User Permissions: ServiceNow enforces ACLs on tool execution
+Tools only access data the logged-in user can see
+Example: Request Status Agent only shows user's own tickets
+Token Expiration: JWT tokens have TTL and expire automatically
+No Credential Storage: Agent orchestrator doesn't store user passwords
+Uses token_hashcode as session identifier
+Actual authentication handled by ServiceNow/CS
+Summary
+Authentication Method: Token-based (token_hashcode) + JWT for Mosaic + Basic Auth for ServiceNow
+
+User Context Flow:
+
+User logs in → CS creates session with token_hashcode
+Request includes token_hashcode + instance_id
+Stored in request context (thread-local)
+Used for JWT token fetching (Mosaic calls)
+ServiceNow tool execution uses Basic Auth but operates in user's context
+All operations scoped by instance_id for multi-tenancy
+Key Point: The token_hashcode acts as the primary user session identifier throughout the agent orchestrator, enabling user-scoped operations while maintaining security through ServiceNow's ACL system.
+
+
+
+
+
