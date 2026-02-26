@@ -1,0 +1,217 @@
+┌──────────────────────────────────────────────────────────────┐
+│                        User (Browser)                         │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│                      LBF Client (React)                       │
+│                   - UI Components                             │
+│                   - WebSocket/SSE handling                    │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│                  Conversation Server (Java)                   │
+│                   - Session management                        │
+│                   - Message routing                           │
+│                   - Skills cache population                   │
+└───────────────────────────┬──────────────────────────────────┘
+                            │ HTTP/SSE
+┌───────────────────────────▼──────────────────────────────────┐
+│              Agent Orchestrator (Python/FastAPI)              │
+│                   - Pipeline execution                        │
+│                   - LLM integration                           │
+│                   - State management                          │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+┌───────▼────────┐  ┌──────▼──────┐  ┌────────▼────────┐
+│ Central Cache  │  │   Mosaic    │  │   ServiceNow    │
+│   (Redis)      │  │  (AI GW)    │  │   Instance      │
+└────────────────┘  └─────────────┘  └─────────────────┘
+
+
+Request Flow - Complete Journey
+1. User Sends Message
+User types "Book a train ticket"
+    ↓
+LBF Client sends WebSocket/HTTP to Conversation Server
+2. Conversation Server Processing
+From the retrieved memory about cache population:
+
+java
+// SessionService.java
+handshakeResponse.getApplicableSkills()
+    ↓
+ConversationSkillCacheService.putSkills()
+    ↓
+Cache Key: {conversationId}_skills
+    ↓
+Central Cache Service stores: {instanceId}:{conversationId}_skills
+What's cached:
+
+Available agents from sn_aia_agent table
+Available workflows from sn_aia_usecase table
+Each with documentTable field for routing
+3. Agent Orchestrator Call
+From cs_agentic_protocol.py:252-286:
+
+POST /v1/agentic/conversations/{conversationId}/turn
+    ↓
+CSAgenticProtocolHandler.receive_cs_turn()
+    ↓
+1. Initialize cache client with instance_id
+2. Create SSE Queue (asyncio.Queue)
+3. Return StreamingResponse immediately
+4. Start background task: process_orchestration()
+    ↓
+Route by message.body.type:
+    - "analyze" → _handle_analyze_message()
+    - "response" → _handle_response_message()
+    - "tool_response" → _handle_tool_response_message()
+    - "input_match" → _handle_input_match_message()
+4. Pipeline Execution
+From CLAUDE.md:289-383:
+
+_call_orchestrator_and_build_response()
+    ↓
+execute_unified_orchestration()
+    ↓
+native_agent/main.py: execute()
+    ↓
+Create ExecutionContext
+    ↓
+Load cached ExecutionState from cache
+    ↓
+PipelineExecutor.execute()
+    ↓
+Loop: START → COMPACT_PLANNER → PLANNER1 → ... → FINISH
+    ↓
+Each stage:
+    1. Preprocessor (build LLM prompt)
+    2. LLM call via Mosaic
+    3. Postprocessor (parse response)
+    4. Update ExecutionContext
+    5. Determine next stage
+    ↓
+StateManager persists plans/tasks to cache
+    ↓
+CommunicationUtil streams messages via SSE queue
+Cache Architecture
+Cache Client (cache_client.py)
+CacheServiceClient - HTTP client for Central Cache Service (Redis-backed):
+
+python
+# Initialization
+CacheServiceClient(instance_id="inst123", base_url="http://cache:8090/api/cache")
+
+# Operations
+client.set(key, value, ttl=3600)  # Store with TTL
+client.get(key)                    # Retrieve
+client.delete(key)                 # Remove
+client.exists(key)                 # Check existence
+client.expire(key, ttl)            # Update TTL
+Key Pattern: {instanceId}:{key}
+
+Cache Types & Services
+From CLAUDE.md:448-459:
+
+Service	Purpose	Cache Key Pattern
+AttachmentsCacheData	File attachments	conversation:{conversationId}
+SysPropertiesCacheService	ServiceNow properties	sys_properties:{property_name}
+ToolM2MCacheService	Tool relationships	sn_aia_agent_tool_m2m|...
+ToolWidgetActionCacheService	Widget actions	sys_ux_widget_action|sys_id:{sys_id_list}
+WidgetCacheService	Widget configs	sys_ux_widget|sys_id:{sys_id}
+TranslationCacheService	i18n translations	translation:{key}:{language}
+LtmCacheService	Long-term memory	User/agent scoped
+SessionCacheService	Session data	{conversationId}_skills
+State Persistence
+ExecutionPlan & ExecutionTask stored in cache:
+
+python
+# From StateManager
+plan_repository.get_active_plan(conversation_id)
+    ↓
+Cache Key: execution_plan:{conversation_id}:active
+    ↓
+Returns: ExecutionPlan object with state (READY, IN_PROGRESS, SUSPENDED, etc.)
+
+task_repository.get_active_task(plan_id)
+    ↓
+Cache Key: execution_task:{plan_id}:active
+    ↓
+Returns: ExecutionTask object with state (QUEUED, READY, ONGOING, SUCCESS, etc.)
+Cache Scoping
+Multi-tenancy via instance_id:
+
+python
+# All cache operations scoped by instance
+{instanceId}:{conversationId}_skills
+{instanceId}:execution_plan:{conversationId}:active
+{instanceId}:sys_properties:glide.ui.security.allow_codetags
+Request Context (thread-local storage):
+
+python
+# Set at request start
+set_request_cache_client(cache_client)
+set_request_instance_id(instance_id)
+set_request_sse_queue(queue)
+
+# Retrieved anywhere in code
+cache_client = get_request_cache_client()
+instance_id = get_request_instance_id()
+SSE Streaming Flow
+From CLAUDE.md:411-418:
+
+python
+# 1. Create SSE queue at request start
+queue = asyncio.Queue()
+set_request_sse_queue(queue)
+
+# 2. Return StreamingResponse immediately
+return StreamingResponse(sse_generator(queue), media_type="text/event-stream")
+
+# 3. Background task sends messages
+send_request_via_sse_queue(event="chunk", data={"text": "..."})
+send_request_via_sse_queue(event="text", data={"message": "..."})
+send_request_via_sse_queue(event="done", data={})
+
+# 4. Put None to signal completion
+queue.put(None)  # Closes SSE connection
+Event Types:
+
+chunk - LLM streaming chunks
+text - Final text response
+collect_inputs - Request user input
+tool_response - Tool execution result
+done - Conversation turn complete
+Key Architectural Patterns
+1. Request Context Pattern
+Thread-local storage for cache client, instance_id, SSE queue
+Available anywhere via get_request_*() functions
+Cleared at request end
+2. State Management Pattern
+ExecutionPlan (conversation-level) → ExecutionTask (step-level)
+Parent-child hierarchy for workflows
+Persisted to cache for multi-turn continuity
+3. Pipeline Pattern
+Sequential stage execution: START → ... → FINISH
+Each stage: execute() → next_stage()
+Resumable via resume_execution_stage
+4. Cache-First Pattern
+Check cache before calling ServiceNow/Glide
+TTL-based expiration
+Fallback to API on cache miss
+5. Async State Lock Pattern
+From cache_client.py:430-526:
+
+python
+# Prevent race conditions during async tool execution
+acquire_async_state_lock(cache_client, conversation_id)
+# ... update state ...
+release_async_state_lock(cache_client, conversation_id)
+Summary
+Architecture: Multi-layered with LBF Client → Conversation Server → Agent Orchestrator → Cache/Mosaic/ServiceNow
+
+Call Flow: SSE streaming with background pipeline execution, state persisted to cache between turns
+
+Cache: Redis-backed via Central Cache Service, instance-scoped, used for skills, state, properties, attachments, and translations
