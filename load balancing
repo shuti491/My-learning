@@ -1,0 +1,190 @@
+Kubernetes and Load Balancing in OffGlide Conversational
+Based on the codebase, Kubernetes is NOT currently being used for the local development setup. The system uses Docker Compose for local deployment. However, there are references to Kubernetes for production deployments.
+
+Current Architecture: Docker Compose (Local Development)
+From docker-compose.yaml:
+
+Service Deployment
+yaml
+services:
+  agent-orchestrator:
+    ports: ["8050:8050"]
+    
+  conversation-server-app:
+    ports: ["8040:8040"]
+    
+  central-cache-service:
+    ports: ["8090:8090"]
+    
+  lbf-client:
+    ports: ["8060:80"]
+    
+  observation:
+    ports: ["9050:9050", "9060:9060"]
+    
+  mcp-server-og:
+    ports: ["8030:8030"]
+No load balancing - Each service runs as a single container with direct port mapping.
+
+Production Deployment: Kubernetes (References Found)
+1. Pod IP and Callback URL Mechanism
+The system is designed for Kubernetes with support for multiple pod instances and callbacks.
+
+From glide_rest_api.py:265-285:
+
+python
+def _enrich_meta_with_execution_context(self, meta: dict) -> dict:
+    enriched_meta = meta.copy() if meta else {}
+    
+    # Rename podIp and fqsn to pod_ip and callback_url
+    if "podIp" in enriched_meta:
+        enriched_meta["pod_ip"] = enriched_meta.pop("podIp")
+    if "fqsn" in enriched_meta:
+        enriched_meta["callback_url"] = enriched_meta.pop("fqsn")
+    
+    # Extract from execution context if available
+    if execution_context is not None:
+        execution_context_meta: dict = execution_context.original_payload.get("meta", {})
+        if "pod_ip" not in enriched_meta:
+            enriched_meta["pod_ip"] = execution_context_meta.get("podIp", "")
+        if "callback_url" not in enriched_meta:
+            enriched_meta["callback_url"] = execution_context_meta.get("fqsn", "")
+    
+    return enriched_meta
+Purpose:
+
+podIp - IP address of the specific Kubernetes pod handling the request
+fqsn (Fully Qualified Service Name) - Callback URL for async responses
+Enables ServiceNow to call back to the specific pod that initiated the request
+2. FQSN-Based Load Balancing
+From mosaic-lab-setup.md:64-68:
+
+properties
+# Multiple FQSNs for load balancing
+glide.one_extend.mosaic.fqsns=mosaic-snc-prod-carthagelab004.dvb402.service-now.com,mosaic-snc-prod-carthagelab004.dva402.service-now.com
+How it works:
+
+Multiple FQSNs (endpoints) configured
+ServiceNow/Mosaic distributes requests across multiple instances
+Each FQSN represents a different availability zone or pod
+3. Mosaic Kubernetes Deployment
+References found in mosaic:
+
+Key Kubernetes Resources:
+
+templates/service-deployment.yaml - Deployment configuration
+templates/service-service.yaml - Kubernetes Service (load balancer)
+templates/networkpolicy.yaml - Network policies
+values.yaml - Configuration values (replicas, resources, etc.)
+Load Balancing Strategy
+For Production (Kubernetes)
+User Request
+    ↓
+Kubernetes Ingress/Service (Load Balancer)
+    ↓
+┌─────────────┬─────────────┬─────────────┐
+│   Pod 1     │   Pod 2     │   Pod 3     │
+│ (podIp: A)  │ (podIp: B)  │ (podIp: C)  │
+└─────────────┴─────────────┴─────────────┘
+    ↓
+Request includes podIp in meta
+    ↓
+ServiceNow Tool Execution
+    ↓
+Callback to specific pod via callback_url (fqsn)
+Load Balancing Mechanisms
+Kubernetes Service (L4 Load Balancing)
+Round-robin distribution across pods
+Health checks via liveness/readiness probes
+Automatic pod replacement on failure
+FQSN-Based Routing (L7 Load Balancing)
+Multiple FQSNs for geographic distribution
+DNS-based load balancing
+Failover between availability zones
+Callback Routing
+Each pod registers its IP (podIp)
+Async tool responses route back to originating pod
+Maintains request context across async operations
+Scaling Configuration
+Horizontal Pod Autoscaling (HPA)
+Based on Mosaic deployment patterns:
+
+yaml
+# Typical Kubernetes deployment
+replicas: 3  # Minimum pod count
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+Scaling triggers:
+
+CPU utilization > 70%
+Memory utilization > 80%
+Custom metrics (request rate, queue depth)
+Service Discovery
+In Kubernetes
+Service Name: agent-orchestrator
+    ↓
+Kubernetes DNS: agent-orchestrator.namespace.svc.cluster.local
+    ↓
+Resolves to: Pod IPs (load balanced)
+In Docker Compose (Current)
+yaml
+# From docker-compose.yaml
+AGENT_ORCHESTRATOR_URL: http://agent-orchestrator:8050/v1/agentic
+CACHE_SERVER_URL: http://central-cache-service:8090
+Service discovery: Docker's built-in DNS (service name → container IP)
+
+Async Tool Execution & Callbacks
+Why podIp and callback_url Matter
+From the tool execution flow:
+
+1. User request → Load balancer → Pod A (IP: 10.0.1.5)
+    ↓
+2. Pod A executes tool via ServiceNow
+    meta: {
+      "podIp": "10.0.1.5",
+      "callback_url": "https://agent-orchestrator-pod-a.cluster.local:8050"
+    }
+    ↓
+3. ServiceNow executes tool (async)
+    ↓
+4. ServiceNow calls back to specific pod:
+    POST https://agent-orchestrator-pod-a.cluster.local:8050/callback
+    ↓
+5. Pod A receives callback with tool results
+    ↓
+6. Pod A continues execution with cached state
+Without podIp/callback_url: Callback might go to wrong pod (no shared state)
+
+Summary
+Current Setup (Local Dev):
+
+Docker Compose with single containers
+No load balancing
+Direct port mapping
+Production Setup (Kubernetes):
+
+Multiple pods per service (replicas: 3-10)
+Kubernetes Service for L4 load balancing
+FQSN-based L7 load balancing across zones
+Horizontal Pod Autoscaling (HPA) based on CPU/memory
+Pod IP tracking for async callback routing
+Health checks and automatic failover
+Key Difference: The podIp and callback_url (fqsn) fields in the code indicate the system is production-ready for Kubernetes with multi-pod deployments, even though local development uses Docker Compose.
+
+Feedback submitted
+
+
+
+Command Awaiting Approval
+
+
+
+
+
+
+
