@@ -1,0 +1,168 @@
+Mosaic at servicenow
+Mosaic Overview
+Mosaic is ServiceNow's AI Gateway and Inference Cloud platform that provides LLM capabilities to the agent orchestrator. It acts as a centralized service for executing AI/LLM requests with capability-based routing.
+
+What is Mosaic?
+Mosaic is an enterprise AI platform that:
+
+Hosts LLM capabilities (GPT-4, Azure OpenAI, Gemini, etc.)
+Routes requests based on capability IDs
+Provides mTLS security for authenticated API calls
+Supports streaming and non-streaming responses
+Manages model deployments and configurations centrally
+Think of it as ServiceNow's internal LLM gateway that abstracts away direct provider integrations.
+
+How Mosaic is Used in Agent Orchestrator
+1. LLM Provider Integration
+Mosaic is configured as a custom LiteLLM provider in litellm_gaic_provider.py:
+
+python
+# Model format: gaic/<deployment_name>
+# Example: "gaic/gpt-4o"
+2. Capability-Based Routing
+Each pipeline stage maps to a specific Mosaic capability ID:
+
+Stage	Capability Key	Purpose
+COMPACT_PLANNER	compact_planner	Simple vs Complex query classification
+PLANNER1	planner1	Intent classification & agent matching
+PLANNER2	planner2	Question answering & synthesis
+OPENAI_AGENT_EXECUTION	openai_agent_execution	Agent-based tool execution
+OPENAI_TOOL_EXECUTION	openai_tool_execution	Single tool execution
+WEB_SEARCH	web_search	Web search queries
+OUTPUT_REFINER	output_refiner	Response refinement
+Configuration: Capability IDs are defined in litellm.yaml under providers.gaic.capability_ids.
+
+3. Request Flow
+From gaic_hooks.py:110-329:
+
+LLM Call Request
+    ↓
+preprocess_gaic_request() [Line 110]
+    ↓
+1. Extract execution stage
+2. Get capability ID for stage
+3. Build GAIC payload with:
+   - capabilityId
+   - payload (messages, tools, etc.)
+   - meta (invocation_source, isGroundedPrompt)
+   - definitionFilters (routing hints)
+    ↓
+4. Configure mTLS SSL context
+5. Store in kwargs['optional_params']['gaic_metadata']
+    ↓
+HTTP POST to Mosaic API
+    ↓
+postprocess_gaic_response_completion() [Line 331]
+    ↓
+1. Parse GAIC response
+2. Extract chat_completion from capabilities
+3. Build LiteLLM ModelResponse
+4. Return to caller
+4. Authentication
+From request_auth_token.py:7-61:
+
+JWT Token: Fetched from JWT auth service with mosaic: true parameter
+mTLS Certificates: Client cert/key for secure communication
+LAB Override: LOCAL_TEMP_JWT_TOKEN_FOR_MOSAIC_LAB env var for local testing
+5. Environment Configuration
+Key environment variables (from gaic_hooks.py:96-108):
+
+bash
+MOSAIC_BASE_URL          # Mosaic endpoint URL
+MOSAIC_API               # API path (default: /api/mosaic/v1/execute)
+MOSAIC_ENV               # LAB or LOCAL
+LOCAL_CLIENT_CERT_PATH   # mTLS client certificate
+LOCAL_CLIENT_KEY_PATH    # mTLS client key
+LOCAL_CA_CERT_PATH       # CA certificate
+6. Special Features
+Grounded Prompts (Execution Stages):
+
+python
+# For OPENAI_AGENT_EXECUTION and OPENAI_TOOL_EXECUTION
+request_item["meta"]["isGroundedPrompt"] = "true"
+Attachment Support (PLANNER2):
+
+python
+# When user attaches files
+request_item["payload"]["attachment_sys_ids"] = "sys_id1,sys_id2,..."
+request_item["definitionFilters"] = {"azure_openai_responses": "true"}
+Web Search:
+
+python
+# For WEB_SEARCH stage
+request_item["definitionFilters"] = {"web_search": "true"}
+Summary
+Mosaic = ServiceNow's AI Gateway that routes LLM requests based on capabilities
+
+Usage in Agent Orchestrator:
+
+Every LLM call goes through Mosaic (when configured as provider)
+Each pipeline stage has a dedicated capability ID
+Requests include mTLS authentication + JWT tokens
+Supports streaming, tool execution, attachments, and web search
+Configured via litellm.yaml and environment variables
+For LAB environment setup, see: README.md:296-298
+
+Feedback submitted
+
+
+
+so for each stage from the table a different llm s bein used?
+
+No, not necessarily different LLMs - it's more about different capability configurations within Mosaic.
+
+How It Works
+Same LLM, Different Capabilities
+Each stage uses the same underlying LLM model (e.g., GPT-4o), but Mosaic routes the request to a different capability configuration based on the capability ID. Think of it like this:
+
+Stage: COMPACT_PLANNER
+    ↓
+Capability ID: "abc-123-compact-planner"
+    ↓
+Mosaic Routes To: GPT-4o with specific prompt/config for classification
+Stage: PLANNER1
+    ↓
+Capability ID: "def-456-planner1"
+    ↓
+Mosaic Routes To: GPT-4o with specific prompt/config for intent matching
+What's Different Per Stage?
+Each capability ID in Mosaic can have:
+
+Different system prompts - Optimized for that stage's task
+Different model parameters - Temperature, max tokens, etc.
+Different model versions - Could use GPT-4o for planning, GPT-3.5 for simple tasks
+Different configurations - Grounding, web search, tool calling enabled/disabled
+Example from the Code
+From gaic_hooks.py:264-290:
+
+python
+request_item = {
+    "payload": payload_block,
+    "capabilityId": capability_id,  # Different per stage
+    "definitionFilters": {},
+    "meta": {
+        "invocation_source": "AI_AGENT",
+        "source": "AI_ORCHESTRATOR",
+    }
+}
+
+# PLANNER stages get special config filters
+if capability_name in {CapabilityKey.COMPACT_PLANNER, CapabilityKey.PLANNER1, CapabilityKey.PLANNER2}:
+    request_item["meta"] = {"configFilters": {"type": "agent_orchestrator"}}
+
+# Execution stages get grounded prompt flag
+if stage_name in EXECUTION_STAGES:
+    request_item["meta"]["isGroundedPrompt"] = "true"
+Key Point
+Mosaic manages the capability configurations centrally - the agent orchestrator just sends the capability ID, and Mosaic decides:
+
+Which model to use
+What prompt template to apply
+What parameters to set
+This allows ServiceNow to change LLM configurations without code changes in the agent orchestrator.
+
+Feedback submitted
+
+
+
+Command Awaiting Approval
