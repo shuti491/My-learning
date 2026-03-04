@@ -1,0 +1,208 @@
+RAG Architecture in OffGlide-Conversational
+Let me explain the RAG (Retrieval-Augmented Generation) architecture, MCP usage, and tokenization in the offglide-conversational repository.
+
+1. RAG Architecture Overview
+The RAG system is implemented through a two-stage pipeline: PLANNER2_RETRIEVAL → PLANNER2
+
+Stage 1: PLANNER2_RETRIEVAL (Document Retrieval)
+File: planner2_retrieval_stage.py:24-279
+
+Purpose: Fetch and rerank relevant documents from multiple sources
+
+Key Operations:
+
+Document Retrieval from Multiple Sources:
+Knowledge Base (KB): kb_knowledge documents
+Service Catalog: sc_cat_item documents
+AI Skills: sys_gen_ai_skill documents
+External Documents: EXTERNAL_DOCUMENT sources
+User Attachments: From cache (AttachmentsCacheData)
+Retrieval Configuration:
+python
+retriever_config = {
+    "searchProfileName": search_profile_name,  # From assistantConfig
+    "queryingUser": querying_user,             # From meta.userId
+    "conversation": {
+        "id": conversation_id,
+        "applicable_skills": applicable_skills  # From cache
+    }
+}
+RAG API Call (line 388):
+python
+retriever_response = await glide_api.get_rag_documents(
+    inputs=retriever_inputs_data
+)
+Parallel Reranking (lines 236-244):
+KB documents and external documents are reranked in parallel for better latency
+Uses reranker service to score document relevance
+Falls back to original documents if reranking fails
+Results Storage:
+python
+execution_context.planner2_retrieval_result = Planner2RetrievalResult(
+    top_documents=reranked_documents,
+    kb_documents=kb_documents,
+    catalogs=catalog_documents,
+    skills=skill_documents,
+    external_documents=reranked_external_documents,
+    attachments=attachments
+)
+Stage 2: PLANNER2 (Answer Generation)
+File: planner2_stage.py:37-150
+
+Purpose: Generate answers using LLM with retrieved context
+
+Key Operations:
+
+Wait for Parallel Tasks (lines 59-77):
+Waits for parallel retrieval if started by compact planner
+Waits for web search results
+Waits for Knowledge Graph NLQ processing
+Preprocessing (line 80):
+Uses version-specific preprocessors (PREPROCESSORS)
+Constructs prompt with retrieved documents
+Formats context for LLM
+LLM Call with Streaming (lines 128-135):
+python
+llm_response = await LlmManager().get_llm_connection().execute(
+    execution_context=execution_context,
+    prompt=prompt,
+    stream=streaming_enabled,
+    stage_override="PLANNER2",
+    llm_call_id=llm_call_id,
+    streaming_postprocessor=postprocessor
+)
+Postprocessing:
+Uses version-specific postprocessors (POSTPROCESSORS)
+Extracts citations
+Formats final response
+2. MCP (Model Context Protocol) Usage
+MCP is used as the communication protocol between the orchestrator and ServiceNow backend services.
+
+MCP Architecture
+Files:
+
+utils.py
+glide_rest_api.py:51
+Key Components:
+MCP Server URL (glide_rest_api.py:51):
+python
+self._mcp_server_url = os.getenv("MCP_SERVER_URL", "http://host.docker.internal:8030") + "/mcp/sn_aia_mcp_server"
+MCP Headers (mcp/utils.py:31-72):
+python
+headers = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "Mcp-Protocol-Version": "2025-06-18",
+    "X-Forwarded-Host": instance_url,
+    "X-Instance-Id": instance_id,
+    "X-Token-Hashcode": token_hashcode,
+    "X-Conversation-Id": conversation_id,
+    "X-Log-Level": log_level
+}
+MCP Tool Execution Flow:
+Orchestrator → MCP Client → MCP Server → ServiceNow Backend
+                ↓
+         execute_request_via_mcp()
+                ↓
+         MCPClient.execute_tool()
+                ↓
+         HTTP POST with MCP headers
+                ↓
+         Parse response (JSON/dict/text)
+Two Types of MCP Execution:a) Internal MCP (ServiceNow tools) - execute_request_via_mcp():
+Retriever tool (RAG documents)
+Reranker tool
+Tool execution via aia_tool_executor
+b) External MCP (3rd party integrations) - execute_external_mcp_tool():
+OAuth 2.0 authentication
+External MCP servers
+Custom tool integrations
+Response Parsing (mcp/utils.py:137-166):
+python
+def _parse_response_text(text: Any) -> dict:
+    # Try JSON parsing first
+    try:
+        return json.loads(text)
+    except:
+        pass
+    
+    # Try ast.literal_eval for Python dict strings
+    try:
+        return ast.literal_eval(text)
+    except:
+        pass
+    
+    # Wrap raw text in data dict
+    return {"data": text}
+MCP in RAG Flow:
+Retriever Call (planner2_retrieval_stage.py:388):
+
+python
+retriever_response = await glide_api.get_rag_documents(inputs=retriever_inputs_data)
+↓ MCP Tool Execution → ServiceNow RAG API → Returns documents
+
+Reranker Call (planner2_retrieval_stage.py:518):
+
+python
+reranker_response = await glide_api.execute_tool(
+    tool_m2m_id=tool_m2m_id,
+    inputs=reranker_input_data,
+    meta={}
+)
+↓ MCP Tool Execution → Reranker service → Returns scored documents
+
+3. Tokenization
+Note: The codebase does NOT implement custom tokenization. Instead, it relies on:
+
+LLM Provider Tokenization
+LiteLLM Integration:
+Uses LiteLLM library which handles tokenization internally
+Different models (GPT-4, GPT-3.5, Azure OpenAI) use their native tokenizers
+Token Counting:
+Tracked in LLM response metadata:
+prompt_tokens
+completion_tokens
+total_tokens
+No Explicit Tokenization Code:
+The system doesn't manually tokenize text
+Relies on the LLM provider's tokenizer (e.g., tiktoken for OpenAI models)
+Token limits are configured per model in pipeline config
+Context Window Management
+Instead of tokenization, the system uses text truncation strategies:
+
+Document Chunking:
+Documents are pre-chunked in ServiceNow backend
+Each chunk has chunk_text and chunk_score
+Chunks are selected based on relevance scores
+Prompt Construction:
+Preprocessors assemble context from top-ranked chunks
+Limits are based on character count or chunk count
+No explicit token counting before LLM call
+Summary
+RAG Flow:
+
+User Query
+    ↓
+PLANNER2_RETRIEVAL
+    ├─ Fetch from KB/Catalog/Skills/External
+    ├─ Get user attachments
+    ├─ Rerank documents (parallel)
+    └─ Store in execution_context
+    ↓
+PLANNER2
+    ├─ Wait for parallel tasks (web search, KG NLQ)
+    ├─ Preprocess (build prompt with context)
+    ├─ LLM call (streaming enabled)
+    ├─ Postprocess (extract citations)
+    └─ Return answer
+MCP Role:
+
+Protocol for tool execution
+Handles authentication & routing
+Standardized request/response format
+Supports both internal (ServiceNow) and external tools
+Tokenization:
+
+Handled by LLM provider (not custom)
+No explicit tokenization in orchestrator
+Context managed via chunk selection and text truncation
