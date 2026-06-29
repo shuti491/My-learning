@@ -1,0 +1,292 @@
+Agent Orchestrator v2: Cluster Architecture & Data Flow
+Overview
+Agent Orchestrator v2 uses a two-cluster architecture to separate concerns between fast in-memory operations and persistent data storage:
+
+Valkey Cluster (Redis-compatible) - Fast in-memory pub/sub and signaling
+Central Cache Service + Glide - Persistent storage with ServiceNow backend
+Architecture Components
+1. Valkey Cluster (In-Memory, Fast)
+Location: valkey_pubsub.py
+
+Purpose: Cross-worker interrupt signaling and real-time coordination
+
+Configuration:
+
+properties
+VALKEY_HOST=host.docker.internal
+VALKEY_PORT=6381
+VALKEY_PASSWORD=
+Key Features:
+
+Pub/Sub Channel: ao:interrupt - broadcasts interrupt signals across all worker processes
+Worker Coordination: Each uvicorn worker subscribes to the channel
+TLS Support: Automatic mTLS in non-dev environments using CERT_PATH and KEY_PATH
+Connection Pooling: Singleton async Redis client shared across the worker
+Data Flow:
+
+Interrupt Request → Worker A publishes to ao:interrupt channel
+                 ↓
+            Valkey Cluster
+                 ↓
+    All workers receive message (pub/sub broadcast)
+                 ↓
+    Only the worker owning the conversation acts on it
+Code Example - Publishing an interrupt:
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/valkey_pubsub.py:83-103
+async def publish_interrupt(conversation_id: str, message_json: str):
+    client = await get_valkey_client()
+    payload = json.dumps({
+        "conversation_id": conversation_id,
+        "message": message_json,
+    })
+    await client.publish(INTERRUPT_CHANNEL, payload)
+Code Example - Subscribing to interrupts:
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/valkey_pubsub.py:144-174
+async def _subscribe_loop():
+    client = await get_valkey_client()
+    pubsub = client.pubsub()
+    await pubsub.subscribe(INTERRUPT_CHANNEL)
+    
+    async for raw_message in pubsub.listen():
+        if raw_message["type"] == "message":
+            # Spawn detached handler task
+            task = asyncio.create_task(_handle_interrupt_message(raw_message["data"]))
+2. Central Cache Service (Persistent Storage)
+Location: README.md
+
+Purpose: Persistent cache with ServiceNow Glide backend fallback
+
+Configuration:
+
+properties
+CACHE_SERVER_URL=http://host.docker.internal:8090
+VALKEY_HOST=localhost
+VALKEY_PORT=6379
+STREAM_SHARD_COUNT=4
+Architecture:
+
+Agent Orchestrator → HTTP REST API → Central Cache Service
+                                            ↓
+                                    ┌──────────────┐
+                                    │ Valkey Cache │ (L1 - fast)
+                                    └──────────────┘
+                                            ↓ (cache miss)
+                                    ┌──────────────┐
+                                    │ Glide API    │ (L2 - persistent)
+                                    │ ServiceNow   │
+                                    └──────────────┘
+Key Features:
+
+Multi-tenancy: Isolated by instanceId
+Domain-specific caching: Same key, different values per domain
+Language localization: Language-specific cache values
+Two-tier storage: Valkey (fast) + Glide (persistent)
+Stream sharding: 4 fixed Valkey stream partitions for pub/sub
+Data Movement Between Clusters
+Cache Client Architecture
+Location: cache_client.py
+
+python
+class CacheServiceClient:
+    """
+    HTTP client for Central Cache Service API.
+    Provides Redis-like interface for basic cache operations.
+    """
+    
+    def __init__(self, instance_id: str, base_url: Optional[str] = None):
+        self.base_url = base_url or os.getenv("CACHE_SERVER_URL") + "/api/cache"
+        self.instance_id = instance_id
+        self.local_cache = TTLCache()  # In-memory L0 cache
+Three-Tier Cache Strategy
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Orchestrator (Python)                                 │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ L0: TTLCache (in-process memory)                     │  │
+│  │ - Fastest, per-worker                                │  │
+│  │ - No network calls                                   │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                        ↓ (miss)                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ HTTP Client → Central Cache Service                  │  │
+│  │ - mTLS in prod (CERT_PATH, KEY_PATH, CA_CERT_PATH)  │  │
+│  │ - JWT auth (Glide-JWT header)                       │  │
+│  │ - Instance scoping (instanceId)                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                        ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Central Cache Service (Java/Spring Boot)                    │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ L1: Valkey Cluster (Redis-compatible)                │  │
+│  │ - Fast in-memory KV store                            │  │
+│  │ - Shared across all CCS pods                         │  │
+│  │ - TTL-based expiration                               │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                        ↓ (miss)                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ L2: Glide API (ServiceNow)                           │  │
+│  │ - Persistent database storage                        │  │
+│  │ - Survives pod restarts                              │  │
+│  │ - Source of truth                                    │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+Request Flow Example: Cache GET
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/cache_client.py:251-286
+def get(self, key: str, is_glide_backed: Optional[bool] = None):
+    """
+    1. Check local TTLCache (L0)
+    2. HTTP GET to Central Cache Service
+    3. CCS checks Valkey (L1)
+    4. On miss, CCS queries Glide API (L2)
+    5. CCS populates Valkey and returns
+    6. Client caches in TTLCache
+    """
+    params = {
+        "instanceId": self.instance_id,
+        "isGlideBacked": is_glide_backed
+    }
+    
+    response = self.session.get(
+        f"{self.base_url}/get/{key}",
+        headers=self._get_headers(),  # Includes Glide-JWT, instance-keys, user-id
+        params=params,
+        timeout=self.timeout
+    )
+    
+    return response.json().get("value") if response.status_code == 200 else None
+Request Flow Example: Cache SET
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/cache_client.py:181-222
+def set(self, key: str, value: Any, ttl: int = None, is_glide_backed: bool = None):
+    """
+    1. HTTP POST to Central Cache Service
+    2. CCS writes to Valkey (L1)
+    3. If is_glide_backed=true, CCS also writes to Glide (L2)
+    4. Returns success
+    """
+    payload = {
+        "key": key,
+        "value": value,
+        "instanceId": self.instance_id,
+        "isGlideBacked": is_glide_backed
+    }
+    if ttl:
+        payload["ttl"] = ttl
+    
+    response = self.session.post(
+        f"{self.base_url}/set",
+        headers=self._get_headers(),
+        json=payload,
+        timeout=self.timeout
+    )
+Security & Authentication
+mTLS Configuration (Non-Dev Environments)
+Agent Orchestrator:
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/cache_client.py:49-85
+def _build_ssl_context():
+    env = os.getenv("ENV", "dev").lower()
+    if env == "dev":
+        return False  # No SSL locally
+    
+    # Enforce mTLS for lab/prod/fedramp
+    cert_path = os.getenv("CERT_PATH", "/etc/tls/tls.crt")
+    key_path = os.getenv("KEY_PATH", "/etc/tls/tls.key")
+    ca_cert_path = os.getenv("CA_CERT_PATH", "/etc/tls-ca/ca.crt")
+    
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cafile=ca_cert_path)
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    return ctx
+Valkey Pub/Sub:
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/valkey_pubsub.py:44-62
+def _build_valkey_ssl_kwargs():
+    env = os.getenv("ENV", "dev").lower()
+    if env == "dev":
+        return {}  # No TLS locally
+    
+    return {
+        "ssl": True,
+        "ssl_certfile": cert_path,
+        "ssl_keyfile": key_path,
+        "ssl_check_hostname": False,
+        "ssl_cert_reqs": "none",
+    }
+JWT Authentication
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/cache_client.py:96-120
+def _build_headers(self, jwt_token: str):
+    headers = {
+        "Content-Type": "application/json",
+        "Glide-JWT": jwt_token,  # ServiceNow JWT token
+        "glide-instance-keys": ctx["instance_keys"],  # Instance validation
+        "glide-user-id": ctx["user_id"]  # User context
+    }
+    return headers
+Request Context Management
+Location: request_context.py
+
+Context Variables (stored per-request using Python's contextvars):
+
+python
+_cache_client_context: ContextVar[CacheServiceClient | None]
+_instance_id_context: ContextVar[Optional[str]]
+_instance_url_context: ContextVar[Optional[str]]
+_token_hashcode_context: ContextVar[Optional[str]]
+_conversation_id_context: ContextVar[Optional[str]]
+_sse_queue_context: ContextVar[Optional[asyncio.Queue]]
+_instance_keys_context: ContextVar[Optional[str]]
+_user_id_context: ContextVar[Optional[str]]
+Why This Matters:
+
+Each HTTP request gets its own isolated context
+Cache client is scoped to the request's instance_id
+JWT tokens are request-specific
+Interrupt handlers restore the original request context to make cache calls
+Key Differences: Valkey vs Central Cache Service
+Feature	Valkey (Pub/Sub)	Central Cache Service
+Purpose	Real-time signaling	Persistent data storage
+Data Type	Ephemeral messages	Key-value cache
+Persistence	No (in-memory only)	Yes (Glide backend)
+Access Pattern	Pub/Sub broadcast	HTTP REST API
+Scope	Cross-worker coordination	Multi-tenant cache
+Latency	Sub-millisecond	~10-50ms (HTTP + Valkey)
+Use Cases	Interrupts, worker sync	Session state, config, tools
+Summary
+Agent Orchestrator v2 uses clusters for:
+
+Valkey Pub/Sub Cluster: Fast cross-worker interrupt signaling via ao:interrupt channel
+Central Cache Service Cluster: Two-tier persistent cache (Valkey L1 + Glide L2) via HTTP REST API
+Data moves between them via:
+
+Valkey: Direct async Redis client for pub/sub (no HTTP)
+Central Cache: HTTP client with mTLS + JWT auth, routing through CacheServiceClient
+Key architectural decisions:
+
+Separation of concerns: signaling vs storage
+Three-tier caching: TTLCache (L0) → Valkey (L1) → Glide (L2)
+Request-scoped context using Python contextvars
+Automatic mTLS in non-dev environments
+Multi-tenancy via instanceId scoping
+Feedback submitted
+
+
+
+Command Awaiting Approval
+
+
+
+
+
+
+
