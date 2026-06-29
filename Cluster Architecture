@@ -282,7 +282,414 @@ Feedback submitted
 
 
 
-Command Awaiting Approval
+End to end Flow:
+
+Utterance Flow in Agent Orchestrator v2 with Cluster Interactions
+Overview
+An utterance (user message) flows through Agent Orchestrator v2 via a multi-stage pipeline, with critical interactions with both Valkey (pub/sub) and Central Cache Service (persistent storage) clusters at key points.
+
+Complete Utterance Flow
+1. Request Entry Point
+Endpoint: POST /v1/agentic/conversations/{conversationId}/turn/
+
+File: cs_agentic_protocol.py
+
+User Utterance → Conversation Server → Agent Orchestrator REST API
+Key Actions:
+
+Extract conversation_id from URL path via middleware
+Set request context variables using Python contextvars
+Initialize SSE queue for streaming responses
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/rest_api/main.py:112-132
+@app.middleware("http")
+async def extract_conversation_id_middleware(request: Request, call_next):
+    path = request.url.path
+    match = re.match(r"/v1/agentic/conversations/([^/]+)/turn/?", path)
+    if match:
+        conversation_id = match.group(1)
+        set_request_conversation_id(conversation_id)
+2. Request Context Initialization
+Cluster Interaction #1: Central Cache Service - Instance Scoping
+
+python
+# Initialize cache client with instance_id
+cache_client = get_or_create_client(instance_id)
+set_request_cache_client(cache_client)
+set_request_instance_id(instance_id)
+set_request_instance_url(instance_url)
+What Happens:
+
+Creates CacheServiceClient scoped to the instance
+Stores in request-scoped ContextVar for the entire request lifecycle
+All subsequent cache operations use this client
+Cache Client Setup:
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/cache_client.py:21-46
+class CacheServiceClient:
+    def __init__(self, instance_id: str, base_url: Optional[str] = None):
+        self.base_url = base_url or os.getenv("CACHE_SERVER_URL") + "/api/cache"
+        self.instance_id = instance_id
+        self.session = httpx.Client(verify=ssl_context)
+        self.local_cache = TTLCache()  # L0 in-memory cache
+3. Conversation History Retrieval
+Cluster Interaction #2: Central Cache Service - History Fetch
+
+File: cs_agentic_protocol.py:883-1012
+
+python
+async def _fetch_and_update_conversation_history(self, message: CSTurnMessage):
+    cache_key = f"conversation:{message.meta.conversationId}"
+    cache_client = get_request_cache_client()
+    
+    # HTTP GET to Central Cache Service
+    cached_data = await cache_client.aget(key=cache_key)
+    
+    if cached_data:
+        cached_conversation = json.loads(cached_data)
+        message.body.conversationHistory = CSHistory(**cached_conversation.get("history", {}))
+Data Flow:
+
+Agent Orchestrator
+    ↓ HTTP GET /api/cache/get/conversation:{conversationId}
+Central Cache Service
+    ↓ Check Valkey (L1)
+    ↓ On miss → Query Glide API (L2)
+    ↓ Return conversation history
+Agent Orchestrator
+    ↓ Append current user utterance to history
+Cache Key Structure:
+
+Key: conversation:{conversationId}
+Scoped by: instanceId (query parameter)
+Full Redis key: {instanceId}:conversation:{conversationId}
+Retrieved Data:
+
+json
+{
+  "instanceId": "qnaaia1",
+  "conversationId": "chatkit-abc123",
+  "history": {
+    "items": [
+      {"turnType": "user", "content": "Hello"},
+      {"turnType": "assistant", "content": "Hi there!"},
+      {"turnType": "user", "content": "Current utterance"}
+    ]
+  },
+  "userContext": {...},
+  "assistantConfig": {...},
+  "tokenHashCode": "..."
+}
+4. Skills/Agents Cache Retrieval
+Cluster Interaction #3: Central Cache Service - Skills Fetch
+
+From Memory: During session handshake, Conversation Server populates skills cache:
+
+ServiceNow Instance (sn_aia_agent, sn_aia_usecase tables)
+    ↓
+SessionService.java → handshakeResponse.getApplicableSkills()
+    ↓
+ConversationSkillCacheService.putSkills()
+    ↓ HTTP POST /api/cache/set
+Central Cache Service
+    ↓ Write to Valkey
+    ↓ Key: {instanceId}:{conversationId}_skills
+Agent Orchestrator Retrieval:
+
+python
+# During pipeline execution
+cache_key = f"{conversation_id}_skills"
+skills = await cache_client.aget(key=cache_key, is_glide_backed=True)
+
+# Returns JSON array:
+[
+  {"documentTable": "sn_aia_agent", "name": "IT Support Agent", ...},
+  {"documentTable": "sn_aia_usecase", "name": "Password Reset", ...}
+]
+PLANNER1 Routing:
+
+documentTable == "sn_aia_agent" → Route to AGENT_EXECUTION
+documentTable == "sn_aia_usecase" → Route to WORKFLOW_EXECUTION
+5. Pipeline Execution
+File: main.py
+
+Pipeline Stages (from memory):
+
+User Utterance
+    ↓
+COMPACT_PLANNER (classify: simple/complex/small_talk/live_agent)
+    ↓
+PLANNER1 (identify task, classify response type)
+    ↓
+┌─────────────────────────────────────────────┐
+│ Decision Point                              │
+│ - QnA → RAG                                 │
+│ - Agent Match → AGENT_EXECUTION             │
+│ - Workflow Match → WORKFLOW_EXECUTION       │
+│ - Tool Match → TOOL_EXECUTION               │
+│ - Data Collection → DATA_COLLECTOR          │
+└─────────────────────────────────────────────┘
+    ↓
+EXECUTION STAGE (agent/workflow/tool)
+    ↓
+RESPONSE GENERATION
+State Management During Execution:
+
+Cluster Interaction #4: Central Cache Service - State Persistence
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/native_agent/state_management/state_manager.py
+class StateManager:
+    async def save_execution_state(self, execution_context: ExecutionContext):
+        state_key = f"execution_state:{conversation_id}"
+        
+        state_data = {
+            "execution_plan": execution_context.state.execution_plan,
+            "execution_tasks": execution_context.state.execution_tasks,
+            "execution_stack": execution_context.state.execution_stack,
+            "tool_execution": execution_context.state.tool_execution,
+            "resume_execution_stage": execution_context.state.resume_execution_stage
+        }
+        
+        # HTTP POST to Central Cache Service
+        await cache_client.aset(
+            key=state_key,
+            value=json.dumps(state_data),
+            ttl=STATE_CACHE_TTL_SECONDS,  # 7 days
+            is_glide_backed=True  # Also write to Glide (L2)
+        )
+Data Flow:
+
+Pipeline Executor
+    ↓ After each stage
+State Manager → save_execution_state()
+    ↓ HTTP POST /api/cache/set
+Central Cache Service
+    ↓ Write to Valkey (L1)
+    ↓ Write to Glide API (L2) if is_glide_backed=True
+6. Tool Execution (If Required)
+Cluster Interaction #5: Async Tool State Lock (Valkey)
+
+File: cache_client.py:34
+
+python
+# When tool requires async execution (e.g., long-running Glide tool)
+async def wait_for_async_state_lock(conversation_id: str):
+    lock_key = f"{ASYNC_STATE_LOCK_PREFIX}{conversation_id}"
+    
+    # Poll Valkey for lock release
+    for _ in range(max_attempts):
+        lock_value = await cache_client.aget(key=lock_key)
+        if not lock_value:
+            return True  # Lock released, tool completed
+        await asyncio.sleep(poll_interval)
+Async Tool Flow:
+
+Tool Execution Stage
+    ↓ Invoke Glide tool (async)
+    ↓ Set lock in Valkey: async_state_lock:{conversationId}
+    ↓ Return to user with "processing" message
+    
+[User waits...]
+
+Glide completes tool
+    ↓ POST /v1/agentic/conversations/{conversationId}/tool-callback
+    ↓ Store result in Valkey: tool_result:{conversationId}
+    ↓ Release lock (delete async_state_lock:{conversationId})
+    
+Next user turn
+    ↓ Pipeline detects completed tool result
+    ↓ Resume from saved execution state
+7. Streaming Response (SSE)
+File: cs_agentic_protocol.py:700-806
+
+python
+async def _sse_event_generator(self, message: CSTurnMessage, request: Request):
+    sse_queue = asyncio.Queue()
+    set_request_sse_queue(sse_queue)
+    
+    # Launch pipeline execution in background
+    pipeline_task = asyncio.create_task(
+        execute_unified_orchestration(message, request)
+    )
+    
+    # Stream events from queue
+    while True:
+        event = await sse_queue.get()
+        if event["event"] == "done":
+            break
+        yield f"event: {event['event']}\ndata: {json.dumps(event['data'])}\n\n"
+SSE Event Types:
+
+message - Text chunks from LLM
+tool_call - Tool invocation
+tool_result - Tool completion
+filler - Voice filler phrases (voice mode)
+done - Turn complete
+8. Conversation History Update
+Cluster Interaction #6: Central Cache Service - History Write
+
+python
+# After pipeline completes
+async def _save_conversation_history_to_cache(
+    cache_client,
+    conversation_id: str,
+    history: CSHistory,
+    user_context: dict,
+    assistant_config: dict
+):
+    cache_key = f"conversation:{conversation_id}"
+    
+    conversation_data = {
+        "conversationId": conversation_id,
+        "history": {"items": history.items},
+        "userContext": user_context,
+        "assistantConfig": assistant_config,
+        "tokenHashCode": get_request_token_hashcode()
+    }
+    
+    # HTTP POST to Central Cache Service
+    await cache_client.aset(
+        key=cache_key,
+        value=json.dumps(conversation_data),
+        is_glide_backed=True  # Persist to Glide
+    )
+Data Flow:
+
+Pipeline Complete
+    ↓ Append assistant response to history
+    ↓ HTTP POST /api/cache/set
+Central Cache Service
+    ↓ Write to Valkey (L1)
+    ↓ Write to Glide API (L2)
+    ↓ Return success
+Agent Orchestrator
+    ↓ Send "done" SSE event
+    ↓ Close SSE stream
+9. Interrupt Handling (Cross-Worker)
+Cluster Interaction #7: Valkey Pub/Sub - Interrupt Signaling
+
+File: valkey_pubsub.py:83-256
+
+Scenario: User clicks "Stop" button during long-running agent execution
+
+python
+# Worker A receives interrupt HTTP request
+async def handle_interrupt(conversation_id: str, message_json: str):
+    # Publish to Valkey pub/sub channel
+    await publish_interrupt(conversation_id, message_json)
+Valkey Pub/Sub Flow:
+
+Worker A (receives interrupt request)
+    ↓ Publish to ao:interrupt channel
+Valkey Cluster
+    ↓ Broadcast to all subscribers
+Worker B, C, D, ... (all workers receive message)
+    ↓ Check local OrchestrationRegistry
+Worker C (owns the conversation)
+    ↓ Cancel ongoing pipeline task
+    ↓ Run interrupt cleanup
+    ↓ Send interrupt SSE event
+    ↓ Update execution state in cache
+Subscriber Loop:
+
+python
+# @/Users/shruti.singh/git/offglide-conversational/agent-orchestrator/va_agentic/utils/valkey_pubsub.py:144-174
+async def _subscribe_loop():
+    client = await get_valkey_client()
+    pubsub = client.pubsub()
+    await pubsub.subscribe(INTERRUPT_CHANNEL)
+    
+    async for raw_message in pubsub.listen():
+        if raw_message["type"] == "message":
+            payload = json.loads(raw_message["data"])
+            conversation_id = payload["conversation_id"]
+            
+            # Only act if THIS worker owns the conversation
+            entry = await signal_interrupt_local(conversation_id)
+            if entry:
+                await run_interrupt_cleanup(...)
+Cluster Interaction Summary
+Stage	Cluster	Operation	Purpose
+1. Context Init	Central Cache	HTTP GET	Initialize cache client
+2. History Fetch	Central Cache	HTTP GET	Load conversation history
+3. Skills Fetch	Central Cache	HTTP GET	Load available agents/workflows
+4. State Save	Central Cache	HTTP POST	Persist execution state
+5. Async Tool Lock	Valkey (direct)	SET/GET	Coordinate async tool execution
+6. History Update	Central Cache	HTTP POST	Save updated conversation
+7. Interrupt Signal	Valkey Pub/Sub	PUBLISH	Cross-worker interrupt coordination
+Key Architectural Patterns
+1. Request Context Isolation
+python
+# Each request gets isolated context via Python contextvars
+_cache_client_context: ContextVar[CacheServiceClient | None]
+_conversation_id_context: ContextVar[Optional[str]]
+_sse_queue_context: ContextVar[Optional[asyncio.Queue]]
+2. Three-Tier Caching
+L0: TTLCache (in-process) → L1: Valkey (shared) → L2: Glide (persistent)
+3. Async State Management
+Execution state saved after each pipeline stage
+Enables resume from interrupts/failures
+7-day TTL for state recovery
+4. Cross-Worker Coordination
+Valkey pub/sub for interrupt signaling
+OrchestrationRegistry tracks which worker owns which conversation
+Only the owning worker acts on interrupt messages
+Complete Utterance Journey
+User: "Reset my password"
+    ↓
+[1] REST API receives utterance
+    ↓ Set request context (instance_id, conversation_id)
+    ↓ Initialize cache client
+    
+[2] Fetch conversation history from Central Cache
+    ↓ HTTP GET → Valkey (L1) → Glide (L2)
+    ↓ Append current utterance
+    
+[3] Fetch skills/agents from Central Cache
+    ↓ HTTP GET → skills cached during handshake
+    
+[4] Execute pipeline
+    ↓ COMPACT_PLANNER → PLANNER1 → AGENT_EXECUTION
+    ↓ Save state to Central Cache after each stage
+    ↓ Stream tokens via SSE queue
+    
+[5] Tool execution (if needed)
+    ↓ Invoke Glide tool
+    ↓ Set async lock in Valkey
+    ↓ Wait for callback
+    
+[6] Generate response
+    ↓ Stream final message chunks
+    
+[7] Update conversation history
+    ↓ HTTP POST → Central Cache → Valkey + Glide
+    
+[8] Send "done" SSE event
+    ↓ Close stream
+    ↓ Clear request context
+
+[If user interrupts during execution]
+    ↓ Publish to Valkey ao:interrupt channel
+    ↓ Owning worker receives broadcast
+    ↓ Cancel pipeline task
+    ↓ Send interrupt SSE event
+This flow shows how every utterance interacts with both clusters multiple times throughout its lifecycle, with Valkey providing fast coordination and Central Cache Service providing persistent storage backed by ServiceNow Glide.
+
+Feedback submitted
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
