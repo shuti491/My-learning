@@ -1,0 +1,111 @@
+Maintaining con history:
+
+
+Conversation history in agent-orchestrator flows through three layers:                                                                                                                                   
+                                                                                                                                                                                                           
+  1. Ingest — CS payload → typed history                                                                                                                                                                   
+  native_interface.py:115 — convert_cs_to_timestamped(cs_items) converts the incoming CS conversationHistory.items into the internal timestamped_conversation_history list, seeded into the execution      
+  payload at :151.                                                                                                                                                                                         
+                                                                                                                                                                                                           
+  2. Storage — single source of truth                                                                                                                                                                      
+  execution/execution_context.py:288-314 — payload key timestamped_conversation_history is the only mutable history object (per the comment at :288, code must go through accessors, never index the       
+  payload key directly):                                                                                                                                                                                   
+  - get_conversation_history_timestamped() (:292) — raw list with timestamps                                                                                                                               
+  - get_conversation_history_as_plain() (:302) — {role, content} pairs via to_plain() (native_agent/utils/conversation_history_utils.py)                                                                   
+  - append_to_conversation_history(entry) (:306) — auto-stamps now_ms if missing                                                                                                                           
+                                                                                                                                                                                                           
+  Every stage that produces a turn appends here — state_manager.py:1794, openai_agent_execution_stage.py:551/578, openai_tool_postprocessor.py:253, data_collector_stage.py:27, planner2_stage.py:340/370, 
+  web_search_stage.py:46, builtin_tool_handlers.py (4 call sites), skill_execution_handler.py:614, widget_action_handler.py:227, tool_refiner_stage.py:335, kg_widget_builder_stage.py:232,                
+  no_answer_fallback_stage.py:91. This is how tool results and intermediate agent turns become part of the history the planners see.                                                                       
+                                                                                                                                                                                                           
+  3. Consumption — cleaning before it hits a prompt                                                                                                                                                        
+  llm/conversation_history_utils.py (separate file from the one in native_agent/utils/) — applied by preprocessors before building planner prompts:                                                        
+  - format_conversation_history() (:146) — strips/merges assistant messages via a filter registry (citations, widgets)                                                                                     
+  - trim_conversation_history_to_max_user_turns() (:126) — caps how many user turns go to Planner2 (constants.DEFAULT_MAX_USER_TURNS_FOR_PLANNER2)                                                         
+  - extract_user_query_from_payload() (:38) — finds the latest real user turn, skipping click-action turns                                                                                                 
+                                                                                                                                                                                                           
+  Persistence across turns: state_manager.py is what caches/reloads ExecutionContext (including this payload) between turns — :1794 shows it also appends directly to history during resume.               
+                                                                                                                                                                                                           
+✻ Brewed for 52s         
+
+ ## How to apply in a new app                                                                                                                                                                             
+                                                                                                                                                                                                           
+  1. Pick ONE object as the source of truth — a list of                                                                                                                                                    
+     {role, content, timestamp} dicts, attached to your request/session                                                                                                                                    
+     state. Don't scatter history across multiple variables.                                                                                                                                               
+  2. Never let code index the list directly. Expose exactly 3 methods:                                                                                                                                     
+     append(), get_raw(), get_plain().                                                                                                                                                                     
+  3. Convert external -> internal format once, at the door (ingest).                                                                                                                                       
+     Nothing downstream should know the external shape.                                                                                                                                                    
+  4. Every producer of a "turn" (tool call, sub-agent, fallback, etc.)                                                                                                                                     
+     just calls append() — nothing more. Cheap and decoupled.                                                                                                                                              
+  5. Clean on a COPY, only at the LLM boundary. Keep raw history intact                                                                                                                                    
+     for UI transcript/audits. Never persist the cleaned version as if                                                                                                                                     
+     it were the source of truth.                                                                                                                                                                          
+  6. Persist the raw notebook (not the cleaned copy) between turns,                                                                                                                                        
+     keyed by conversation ID, so context survives stateless requests.  
+
+
+## Flow                                                                                                                                                                                                  
+                                                                                                                                                                                                           
+  ┌─────────────────────────────────────────────────────────────────┐                                                                                                                                      
+  │ 1. INGEST (start of a request)                                  │                                                                                                                                      
+  │    External format (UI/API payload)                             │                                                                                                                                      
+  │        │                                                         │                                                                                                                                     
+  │        ▼  convert()                                              │                                                                                                                                     
+  │    Internal format  →  seeded into the "notebook"                │                                                                                                                                     
+  └─────────────────────────────────────────────────────────────────┘                                                                                                                                      
+                                │                                                                                                                                                                          
+                                ▼                                                                                                                                                                          
+  ┌─────────────────────────────────────────────────────────────────┐                                                                                                                                      
+  │ 2. THE NOTEBOOK (single source of truth, in memory)              │                                                                                                                                     
+  │                                                                   │                                                                                                                                    
+  │    history = [ {role, content, timestamp}, ... ]                 │                                                                                                                                     
+  │                                                                   │                                                                                                                                    
+  │    Only 3 doors in/out:                                          │                                                                                                                                     
+  │      - append(entry)      <- every stage that produces a turn    │                                                                                                                                     
+  │      - read_raw()         <- full history w/ timestamps          │                                                                                                                                     
+  │      - read_plain()       <- clean {role, content} pairs         │                                                                                                                                     
+  │                                                                   │                                                                                                                                    
+  │    Nothing else is allowed to touch the list directly.           │                                                                                                                                     
+  └─────────────────────────────────────────────────────────────────┘                                                                                                                                      
+         ▲               ▲                 ▲                ▲                                                                                                                                              
+         │ append        │ append          │ append         │ append                                                                                                                                       
+    ┌────┴────┐   ┌──────┴─────┐   ┌───────┴──────┐  ┌──────┴──────┐                                                                                                                                       
+    │ Planner │   │ Tool call  │   │ Web search   │  │ Fallback /  │                                                                                                                                       
+    │ turn    │   │ result     │   │ result       │  │ any stage   │                                                                                                                                       
+    └─────────┘   └────────────┘   └──────────────┘  └─────────────┘   
+                                   
+                               │                                                                                                                                                                          
+                                ▼                                                                                                                                                                          
+  ┌─────────────────────────────────────────────────────────────────┐                                                                                                                                      
+  │ 3. CONSUME (right before an LLM call — never before)             │                                                                                                                                     
+  │                                                                   │                                                                                                                                    
+  │    read_raw() / read_plain()                                     │                                                                                                                                     
+  │        │                                                          │                                                                                                                                    
+  │        ▼  make a COPY, don't mutate original                     │                                                                                                                                     
+  │    clean_for_prompt(copy):                                       │                                                                                                                                     
+  │      - strip noise (widgets/citations -> plain text)             │                                                                                                                                     
+  │      - merge consecutive same-role turns                         │                                                                                                                                     
+  │      - trim to last N user turns (token budget)                  │                                                                                                                                     
+  │        │                                                          │                                                                                                                                    
+  │        ▼                                                          │                                                                                                                                    
+  │    Prompt sent to LLM                                            │                                                                                                                                     
+  └─────────────────────────────────────────────────────────────────┘                                                                                                                                      
+                                │                                                                                                                                                                          
+                                ▼                                                                                                                                                                          
+  ┌─────────────────────────────────────────────────────────────────┐                                                                                                                                      
+  │ 4. PERSIST (end of request, across turns)                        │                                                                                                                                     
+  │    Notebook (session/context state) saved to cache/DB,           │                                                                                                                                     
+  │    keyed by conversation_id.                                      │                                                                                                                                    
+  │    Next request: reload it, go back to step 2.                    │                                                                                                                                    
+  └─────────────────────────────────────────────────────────────────┘  
+  
+                                   
+    ## Core idea                                                                                                                                                                                             
+  One shared "notebook" that every part of the pipeline can write a line                                                                                                                                   
+  into (in one agreed format), but nobody touches directly — they call                                                                                                                                     
+  a write function instead. Before talking to the LLM, take a *copy*,                                                                                                                                      
+  clean it up, and send the copy. The original stays untouched.                                                                                          Jump to bottom (ctrl+End) ↓ 
+
+
