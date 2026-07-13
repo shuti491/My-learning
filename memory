@@ -1,0 +1,24 @@
+Conversation Buffer:
+Stores the entire chat history and sends all previous messages to the model each time. This helps the AI remember everything discussed, but token usage keeps increasing as the conversation grows, making it slower and more expensive for long conversations.
+
+Windowed Conversation Buffer:
+Stores only the most recent k messages or interactions. Older messages are discarded as new ones arrive. This keeps token usage low and responses faster, but the AI may forget important details mentioned earlier in the conversation.
+
+ConversationSummaryMemory:
+Instead of storing the entire conversation, it continuously creates a summary of previous discussions and keeps updating it. This reduces token usage while preserving important context. It is useful for long conversations because the AI remembers key information without needing every individual message.
+This means that whenever we ask the LLM a question, there are two calls:
+
+The user prompt
+
+The summarization prompt
+This summarization helps keep the chat history relatively small without using too many tokens during inference. However, since the original question was not explicitly saved in the chat history, the model needed to infer it based on the context. This is a disadvantage if specific information needs to be stored in the chat history. Moreover, multiple calls to the same LLM are needed, one for the prompt and one for the summarization. This can slow down computing time.
+
+Comparison
+Conversation Buffer:
+This is the simplest memory implementation and ensures that no information is lost as long as everything fits within the model's context window. However, as the conversation grows, more tokens need to be processed, leading to slower responses and higher costs. It is therefore better suited for large-context LLMs, and retrieving specific information from very long chat histories can become difficult.
+
+Windowed Conversation Buffer:
+This approach keeps only the last k interactions, so large-context LLMs are not required unless the recent history itself becomes large. It guarantees no information loss within those recent interactions. However, older information is discarded, meaning only the last k exchanges are remembered, and there is no compression or summarization of those interactions.
+
+Conversation Summary Memory:
+This method maintains a summary of the entire conversation, allowing long interactions while significantly reducing the number of tokens needed. It can preserve important historical context without storing every message. However, generating and updating summaries requires an additional LLM call for each interaction, and the quality of memory depends heavily on how well the model performs summarization.
