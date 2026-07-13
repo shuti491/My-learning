@@ -1,0 +1,144 @@
+using prompt for orchestration:
+
+Here's the full map of where prompts live and how they flow into an LLM call in this stack. There are three distinct prompt systems — the current DARE one dominates.
+
+Where prompts are stored
+1. DARE system prompt — Python string constants (the main one)
+agent-orchestrator-v2/va_agentic/native_agent/execution/pipeline_stages/dare/
+
+File	Holds
+prompts/main_prompts.py	The whole static system prompt, as ~40 named SECTION_* constants (identity/Otto, working methodology, capabilities, tool-use rules, task management, failure handling, response formatting…) plus standalone DARE_BASH_TOOL_SECTION, DARE_FINISH_TOOL_SECTION, DARE_THINKING_SCRATCHPAD_SECTION. build_dare_system_prompt(...) stitches the sections together based on flags.
+prompts_v2.py	build_dare_system_prompt_v2 — a newer variant of the same.
+prompts/sub_agent_prompts.py	Per-sub-agent system prompts (Explore, Plan, Verification, General Purpose).
+prompts/memory_prompts.py, plan_nudge.py, bash_failure_nudge.py, discovered_agents_nudge.py, system_reminder.py	The <system-reminder> nudge texts injected mid-turn.
+Convention (prompts/README.md): these files are pure static strings — no f-strings, no imports. Substitution happens later, at assembly time.
+
+2. Skills — Markdown files (lazy-loaded guidance)
+dare/skills/**/SKILL.md (44 files). These are prompt fragments too, but not sent upfront — only a lightweight catalog is shown to the model, and the full SKILL.md body is pulled on demand via the skill tool (progressive disclosure).
+
+3. Legacy planner prompts — .txt templates
+agent-orchestrator-v2/va_agentic/configs/prompt/*.txt — agent_instructions.txt, structured_output_prompt_v1.txt, conversation_label_prompt_v1.txt, widget_refiner_prompt_v1.txt, refiner/*.txt. These use {{placeholder}} slots filled by utils/prompt_utils.py → build_prompt() (plain string replace; non-strings become JSON). These belong to the older planner/refiner path, not the core DARE loop.
+
+How they're assembled and used
+The assembly happens once per turn in orchestrator/parent_agent.py:165:
+
+
+system_prompt = build_system_prompt(agent_data, ..., enabled_features=...)   # static, cached
+... = build_dynamic_context(agent_data, user_query, execution_context, ...)  # per-turn
+input/system_prompt.py is the composer: it calls build_dare_system_prompt() and appends optional sections (bash, sub-agents, platform agents, memory guidance, dynamic-data directives) gated by feature flags — so a given deployment gets a deterministic, byte-stable prompt.
+
+The result is a 4-tier prompt stack, ordered deliberately for prompt-prefix caching (DARE's cache-first principle):
+
+
+┌────────────────────────────────────────────────────────────┐
+│ [1] STATIC SYSTEM PROMPT   ← system_prompt.py + main_prompts │  byte-identical
+│     • identity, methodology, tool rules, formatting          │  every turn →
+│     • feature-gated sections (bash, memory, sub-agents)      │  CACHE HIT
+├────────────────────────────────────────────────────────────┤
+│ [2] DYNAMIC CONTEXT  (<system-reminder> user message)        │  dynamic_context.py
+│     • session-stable: user_context, instance_context,        │  _SECTIONS[]
+│       persona, deferred_tools  (render once, resurface       │  (Always / Delta /
+│       after compaction)                                      │   Self-managed)
+│     • per-turn: plan, token_budget, page_context, skills,    │
+│       active_widgets                                         │
+├────────────────────────────────────────────────────────────┤
+│ [3] STM — conversation history (append-only, never mutated)  │
+├────────────────────────────────────────────────────────────┤
+│ [4] CURRENT TURN — the user's new message                    │
+└────────────────────────────────────────────────────────────┘
+        +  mid-turn: nudges injected as <system-reminder>  (prompts/*_nudge.py)
+        +  on demand: SKILL.md bodies pulled into context
+        +  sub-agents: their own prompt from sub_agent_prompts.py
+The golden rule enforced everywhere (dare-principles.md #5): anything that varies per user/turn must NOT go in tier [1] — it goes in tier [2] as a dynamic-context section, or as a <system-reminder>. That keeps the system prompt byte-identical so the LLM prompt cache hits on every call.
+
+Summary
+Core prompts = Python string constants in dare/prompts/ + dare/prompts_v2.py, assembled by dare/input/system_prompt.py into a static, cacheable system prompt.
+Per-turn state = dare/input/dynamic_context.py _SECTIONS, injected after the cached prefix as a <system-reminder> block.
+On-demand guidance = dare/skills/**/SKILL.md, lazy-loaded.
+Nudges/reminders = dare/prompts/*_nudge.py + system_reminder.py, injected mid-loop.
+Legacy planner/refiner = configs/prompt/*.txt templates rendered via build_prompt() with {{placeholder}} substitution.
+
+
+E2E Example: "Summarise this incident and add a comment"
+Scenario: user is on an incident form (INC0012345) and types that one sentence. DARE resolves "this incident" from page context, reads it, summarises, then writes a comment — a 2-tool task that takes 3 LLM calls.
+
+Phase 1 — One-time assembly (per CS turn, before the loop)
+In parent_agent.py:
+
+
+CS turn arrives ─► DareAgentExecutionStage ─► parent_agent.run()
+      │
+      ├─ build_system_prompt()      ◄── prompts/main_prompts.py (SECTION_* constants)
+      │     = TIER 1 (static, byte-identical, cached)
+      │
+      ├─ build_dynamic_context()    ◄── input/dynamic_context.py (_SECTIONS)
+      │     = TIER 2 <system-reminder>: page_context{INC0012345}, plan,
+      │       skills catalog, memory, active_widgets
+      │
+      └─ build_input_messages()     ◄── STM (past history) + tier-2 + current user msg
+            = the `messages` list handed to the loop
+Phase 2 — The agentic loop (run_agent_loop, loop/run.py:354)
+Each pass through the for turn in range(max_turns) loop = one LLM call. The system prompt is re-attached every pass; messages only ever grows.
+
+
+                    ┌───────────────────────────────────────────────────────────┐
+                    │  full_messages = [SYSTEM (tier1)] + messages   (run.py:394) │
+                    └───────────────────────────────────────────────────────────┘
+
+╔═══════════ LLM CALL #1 ═══════════╗
+║ prompt sent:                       ║
+║  [1] system prompt   (cached)      ║
+║  [2] <system-reminder> page_ctx,   ║
+║      plan, skills catalog          ║
+║  [3] STM (empty-ish)               ║
+║  [4] user: "summarise this…"       ║
+╚════════════════════════════════════╝
+        │ model reasons: "this incident" → page_context sysId
+        ▼
+   LLM returns  tool_call: read_record(INC0012345)      ← NOT final text
+        │
+        ├─ execute tool ─► result appended to `messages`  (append-only)
+        ├─ inject_messages() callback ─► maybe a <system-reminder> nudge appended
+        └─ loop continues  ──────────────────────────────┐
+                                                          │
+╔═══════════ LLM CALL #2 ═══════════╗                     │
+║  [1] system prompt   (CACHE HIT — byte-identical)  ◄────┘
+║  [2] tier-2 delta sections (only if changed)       ║
+║  [3] STM now includes: assistant tool_call +       ║
+║      tool result(incident fields)                  ║
+╚════════════════════════════════════╝
+        │ model has the data; decides it needs the "add comment" skill
+        ▼
+   LLM returns  tool_call: skill(add_record_action)     ← pulls SKILL.md ON DEMAND
+        │
+        ├─ full SKILL.md body loaded into context (progressive disclosure)
+        ├─ then tool_call: add_comment(...) executed ─► result appended
+        └─ loop continues  ──────────────────────────────┐
+                                                          │
+╔═══════════ LLM CALL #3 ═══════════╗                     │
+║  [1] system prompt   (CACHE HIT)                   ◄────┘
+║  [3] STM: + skill body + comment-added result      ║
+╚════════════════════════════════════╝
+        │ task done — nothing left to call
+        ▼
+   LLM returns  FINAL TEXT (no tool_calls)  ──► finish_reason = "stop"
+        │
+        └─ loop EXITS
+Exit condition: the loop ends when a call returns text with no tool calls (or finish tool / max_turns / interrupt).
+
+Phase 3 — Finish
+
+final text ─► streamed to UI via SSE (on_text_delta)
+           ─► STM + DareRuntimeContext persisted (Redis + Glide)
+           ─► SSE stream closes
+The load-bearing ideas (why it's built this way)
+Prompt source	When it enters	Changes across the 3 calls?
+System prompt (main_prompts.py)	prepended every call (run.py:394)	Never — byte-identical → prompt-cache HIT on calls #2, #3
+Dynamic context (dynamic_context.py)	tier-2 <system-reminder>	Delta sections re-render only if changed (e.g. page_context stayed same → skipped)
+STM (messages)	grows each call	Append-only — tool calls + results + nudges are added, earlier messages never mutated (cache-safe)
+Skill body (SKILL.md)	pulled mid-loop at call #2	Loaded on demand, not upfront
+Nudges (*_nudge.py)	inject_messages between calls	Injected only when triggered (e.g. plan stale 8+ turns)
+So "one CS turn" = one assembly + N LLM calls inside the loop, and the prompt is the same cached system block on top of an ever-growing append-only message list. That append-only + static-prefix discipline is exactly what makes the prefix cache hit on every call after the first.
+
+Summary:
+DARE builds one fixed system prompt plus a running message list. It sends both to the LLM, which either answers or requests a tool. Tool results get appended, then it asks the LLM again — looping until the LLM replies with final text. The fixed prompt stays cached throughout.
