@@ -1,0 +1,103 @@
+Text classification:
+### 1. Text Classification
+
+Text classification is the task of assigning predefined labels to text, such as **positive/negative sentiment**, spam/not spam, or topic categories. The challenge is understanding language context and meaning, not just matching keywords.
+
+### 2. Generative vs Representation Models
+
+Language models for classification can broadly be divided into:
+
+* **Representation models:** Convert text into numerical representations (embeddings/features).
+* **Generative models:** Generate text and can infer the label by reasoning through prompts.
+
+---
+
+### 3. Representation Language Models
+
+These models focus on creating rich vector representations of text rather than generating new text. The generated embeddings capture semantic meaning and can be used for downstream tasks like classification, clustering, and search.
+
+---
+
+### 4. Task-Specific Pretrained Models
+
+These are models already fine-tuned for a particular task, such as sentiment analysis. Since they have learned patterns from large labeled datasets, they often perform well immediately without additional training.
+
+**Example:** A sentiment BERT model directly predicting Positive or Negative.
+
+---
+
+### 5. Embedding Models
+
+Embedding models generate **general-purpose vector representations** of text. These embeddings can then be fed into traditional machine learning classifiers like Logistic Regression, SVM, or XGBoost.
+
+**Pipeline:**
+Text → Embedding → Classifier → Label
+
+---
+
+### 6. Fine-Tuning
+
+Fine-tuning means taking a pretrained model and training it further on your own domain-specific data. This adapts the model to your specific problem, often improving accuracy when enough labeled data is available.
+
+---
+
+### 7. Generative Models for Classification
+
+Generative models can perform classification simply through prompting, without explicit retraining.
+
+**Example Prompt:**
+*"Is this review positive or negative? Review: 'The product was amazing.'"*
+
+The model generates: **Positive**.
+
+---
+
+### 8. Encoder-Decoder Models (Flan-T5)
+
+Encoder-decoder models first understand the input using an encoder and then generate an output using a decoder. They are particularly good at instruction-following tasks and can perform classification by generating labels.
+
+---
+
+### 9. Decoder-Only Models (GPT-3.5)
+
+Decoder-only models generate text token by token based on the prompt. They can perform **zero-shot** or **few-shot classification**, meaning they often require little or no additional training data.
+
+---
+
+### 10. Zero-Shot Classification
+
+The model performs classification without being explicitly trained on the target dataset. It relies on its pretrained knowledge and understanding of instructions.
+
+---
+
+### 11. Few-Shot Classification
+
+Instead of training, you provide a few examples in the prompt. The model learns the pattern from these examples and predicts labels for new inputs.
+
+---
+
+### 12. Supervised Learning
+
+Supervised classification requires labeled data (e.g., reviews marked as positive or negative). Models learn the mapping between text and labels during training.
+
+---
+
+### 13. Unsupervised Classification
+
+When labels are unavailable, we use techniques like clustering and topic modeling to discover hidden patterns or groups in the data automatically.
+
+---
+
+### 14. Clustering
+
+Clustering groups similar documents together based on semantic similarity. The algorithm discovers natural groupings without predefined labels.
+
+**Example:** Reviews automatically grouped into delivery issues, product quality, and customer service.
+
+---
+
+### 15. Topic Modeling
+
+Topic modeling attempts to assign meaningful names or themes to clusters by identifying important words and concepts within each group.
+
+**Example:** A cluster containing words like *refund, payment, invoice* may be labeled **Billing Issues**.
