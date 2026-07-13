@@ -1,0 +1,173 @@
+What is LLM
+An LLM is a prediction machine. Based on a certain input, the prompt, it tries to predict the words that might follow it. At its core (illustrated in Figure 6-6), the prompt does not need to be more than a few words to elicit a response from the LLM.
+
+What is embeddings
+Embeddings are numerical representations of data where similar meanings end up close together in mathematical space.
+
+Tokens
+Token: Small unit of text that the model processes.
+Embedding: Numerical representation of the meaning of that text.
+
+An easy way to remember it:
+
+Tokens are the letters/words the AI reads. Embeddings are the understanding the AI creates from them.
+elation between Tokens and Embeddings
+
+Suppose you have a document:
+
+"ServiceNow uses AI agents."
+Text is split into tokens:
+["Service", "Now", " uses", " AI", " agents", "."]
+The embedding model reads these tokens and converts the entire sentence into an embedding vector:
+[0.21, -0.54, 0.91, ...]
+
+So:
+
+Text
+  ↓
+Tokens (small pieces)
+  ↓
+Embedding Model
+  ↓
+Embedding Vector (meaning as numbers)
+
+Prompt engineering:
+instruction, data, and output indicators
+
+Specificity
+Accurately describe what you want to achieve. Instead of asking the LLM to “Write a description for a product” ask it to “Write a description for a product in less than two sentences and use a formal tone.”
+Hallucination
+LLMs may generate incorrect information confidently, which is referred to as hallucination. To reduce its impact, we can ask the LLM to only generate an answer if it knows the answer. If it does not know the answer, it can respond with “I don’t know.”
+Order
+Either begin or end your prompt with the instruction. Especially with long prompts, information in the middle is often forgotten.1 LLMs tend to focus on information either at the beginning of a prompt (primacy effect) or the end of a prompt (recency effect).
+
+These advanced components can quickly make a prompt quite complex. Some common components are:
+
+Persona
+Describe what role the LLM should take on. For example, use “You are an expert in astrophysics” if you want to ask a question about astrophysics.
+Instruction
+The task itself. Make sure this is as specific as possible. We do not want to leave much room for interpretation.
+Context
+Additional information describing the context of the problem or task. It answers questions like “What is the reason for the instruction?”
+Format
+The format the LLM should use to output the generated text. Without it, the LLM will come up with a format itself, which is troublesome in automated systems.
+Audience
+The target of the generated text. This also describes the level of the generated output. For education purposes, it is often helpful to use ELI5 (“Explain it like I’m 5”).
+Tone
+The tone of voice the LLM should use in the generated text. If you are writing a formal email to your boss, you might not want to use an informal tone of voice.
+Data
+The main data related to the task itself.
+
+
+Chain-of-Thought: Think Before Answering
+The first and major step toward complex reasoning in generative models was through a method called chain-of-thought. Chain-of-thought aims to have the generative model “think” first rather than answering the question directly without any reasoning.6
+
+zero shot chain of thought
+Zero-shot Chain of Thought (Zero-shot CoT) is a prompting technique where you ask an AI model to reason step by step without providing any examples beforehand.
+
+Normally, in zero-shot prompting, you simply ask:
+
+"If I have 3 apples and buy 2 more, how many apples do I have?"
+
+The model answers directly: 5.
+
+In Zero-shot CoT, you add a phrase like:
+
+"Let's think step by step."
+
+or
+
+"Explain your reasoning before answering."
+
+This encourages the model to generate intermediate reasoning steps.
+
+Tree-of-Thought: Exploring Intermediate Steps
+
+The ideas of chain-of-thought and self-consistency are meant to enable more complex reasoning. By sampling from multiple “thoughts” and making them more thoughtful, we aim to improve the output of generative models.
+
+These techniques only scratch the surface of what is currently being done to mimic complex reasoning. An improvement to these approaches can be found in tree-of-thought, which allows for an in-depth exploration of several ideas.
+
+The method works as follows. When faced with a problem that requires multiple reasoning steps, it often helps to break it down into pieces. At each step, and as illustrated in Figure 6-18, the generative model is prompted to explore different solutions to the problem at hand. It then votes for the best solution and continues to the next step.10
+
+A disadvantage of this method is that it requires many calls to the generative models, which slows the application significantly. Fortunately, there has been a successful attempt to convert the tree-of-thought framework into a simple prompting technique.
+
+Instead of calling the generative model multiple times, we ask the model to mimic that behavior by emulating a conversation between multiple experts. These experts will question each other until they reach a consensus. An example of a tree-of-thought prompt is:
+
+# Zero-shot tree-of-thought
+zeroshot_tot_prompt = [
+    {"role": "user", "content": "Imagine three different experts are answering this question. All experts will write down 1 step of their thinking, then share it with the group. Then all experts will go on to the next step, etc. If any expert realizes they're wrong at any point then they leave. The question is 'The cafeteria had 23 apples. If they used 20 to make lunch and bought 6 more, how many apples do they have?' Make sure to discuss the results."}
+]
+
+
+
+Output Verification
+
+Providing Examples
+A simple and straightforward method to fix the output is to provide the generative model with examples of what the output should look like. As we explored before, few-shot learning is a helpful technique that guides the output of the generative model. This method can be generalized to guide the structure of the output as well.
+
+For example, let us consider an example where we want the generative model to create a character profile for an RPG game. We start by using no examples:
+
+# Zero-shot learning: Providing no examples
+zeroshot_prompt = [
+    {"role": "user", "content": "Create a character profile for an RPG game in JSON format."}
+]
+
+# Generate the output
+outputs = pipe(zeroshot_prompt)
+print(outputs[0]["generated_text"])
+ ```json
+{
+  "characterProfile": {
+    "name": "Eldrin Stormbringer",
+    "class": "Warlock",
+    "race": "Half-Elf",
+    "age": 27,
+   "gender": "Male",
+    "alignment": "Chaotic Good",
+    "background": "Rogue",
+    …
+    },
+    "attributes": {
+      "strength": 10,
+      "dexterity": 17,
+      "constitution": 12,
+      "intelligence": 12,
+      "wisdom": 10,
+      "charisma
+The preceding truncated output is not valid JSON since the model stopped generating tokens after starting the “charisma” attribute. Moreover, we might not want certain attributes. Instead, we can provide the model with a number of examples that indicate the expected format:
+
+# One-shot learning: Providing an example of the output structure
+one_shot_template = """Create a short character profile for an RPG game. Make sure to only use this format:
+
+{
+  "description": "A SHORT DESCRIPTION",
+  "name": "THE CHARACTER'S NAME",
+  "armor": "ONE PIECE OF ARMOR",
+  "weapon": "ONE OR MORE WEAPONS"
+}
+"""
+one_shot_prompt = [
+    {"role": "user", "content": one_shot_template}
+]
+
+# Generate the output
+outputs = pipe(one_shot_prompt)
+print(outputs[0]["generated_text"])
+{
+  "description": "A cunning rogue with a mysterious past, skilled in stealth and deception.",
+  "name": "Lysandra Shadowstep",
+  "armor": "Leather Cloak of the Night",
+  "weapon": "Dagger of Whispers, Throwing Knives"
+}
+The model perfectly followed the example we gave it, which allows for more consistent behavior. This also demonstrates the importance of leveraging few-shot learning to improve the structure of the output and not only its content.
+
+Grammar: Constrained Sampling
+Few-shot learning has a big disadvantage: we cannot explicitly prevent certain output from being generated. Although we guide the model and give it instructions, it might still not follow it entirely.
+
+Instead, packages have been rapidly developed to constrain and validate the output of generative models, like Guidance, Guardrails, and LMQL. In part, they leverage generative models to validate their own output, as illustrated in Figure 6-19. The generative models retrieve the output as new prompts and attempt to validate it based on a number of predefined guardrails.
+
+
+
+
+
+
