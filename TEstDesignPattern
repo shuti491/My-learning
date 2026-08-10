@@ -1,0 +1,46 @@
+ what is POM
+
+POM = Page Object Model — a UI test design pattern where each screen (or logical region of a screen) gets its own class that encapsulates:
+
+- Locators (CSS/XPath selectors for that screen's elements)
+- Actions (methods like sendMessage(), openPanel(), clickButton())
+
+Tests then call these methods instead of touching the raw browser/page API directly.
+
+In this repo, OGWebPage.java:30 (extends PageBase) is the main Page Object for the chat panel — it wraps Playwright's Page object. It's further decomposed into smaller Page Objects for sub-regions: RightPanel, LeftPanel, BotMessage, WorkflowStatusControl.
+
+Why it matters: if the chat UI's DOM/selectors change, you fix it in one place (IOGConstants for selectors, OGWebPage for the interaction logic) instead of every test file that references that element. Tests stay readable (ogWebPage.sendMessageAndWaitForResponse(...)) instead of littered with raw page.locator(...).click() calls.
+
+Test Design:
+Design Patterns → System Design Mapping
+
+1. Page Object Model (POM) — core structural pattern
+- OGWebPage extends PageBase (OGWebPage.java:30) wraps the raw Playwright Page, hiding shadow-DOM/CSS selector details behind methods like sendMessageAndWaitForResponse().
+- Sub-objects decompose the page into regions: RightPanel, LeftPanel, BotMessage, WorkflowStatusControl — each owns its own locators/actions (composition over one giant class).
+- System design mapping: this is the classic UI abstraction layer — tests (consumers) never touch Playwright Locator/Page directly, so a DOM change only requires editing one page object, not every test (IOGConstants centralizes selectors as the single config source).
+
+2. Template Method — OffglideTestBase
+- OffglideTestBase extends PlaywrightTest (OffglideTestBase.java:27) defines setUp()/final cleanup() lifecycle hooks; subclasses override setUp() but cleanup is fixed (final), guaranteeing retry-screenshot/conversation-cleanup always runs.
+- Mapping: enforces a non-negotiable test lifecycle contract across ~40 IT classes — the invariant (teardown) is centralized, the variable part (login/setup) is pluggable.
+
+3. Inheritance-based Specialization (Page Object subclassing)
+- JanusOGWebPage extends OGWebPage, PlaygroundOGWebPage extends OGWebPage, A2ASetupPage extends PlaygroundOGWebPage, JanusTestBase/PlaygroundTestBase extends OffglideTestBase.
+- Mapping: three chat surfaces (NAP, Janus, Playground) share ~90% behavior; variance is isolated to overridden methods — avoids duplicating the whole POM per surface.
+
+4. Repository/Driver Pattern — com.nextwave.recorddrivers
+- ConversationRecordDriver, DeploymentConfigAttributesDriver, NowAssistSettingsRecordDriver, UserPreferencesDriver, AIADrivers, with shared logic in CommonDrivers (utility class).
+- Mapping: isolates all GlideRecord/table access behind driver classes — tests do setup/teardown via drivers, not raw record queries, decoupling test intent from ServiceNow schema.
+
+5. Strategy Pattern (with fallback chain) — SimilaritySkill
+- assertSimilarity() (SimilaritySkill.java:79) tries Jaccard similarity (JaccardSimilarity, threshold 0.75) first, falls back to a ServiceNow-hosted similarity capability API if the primary strategy fails.
+- Mapping: decouples "is this response correct" from a single brittle algorithm — two interchangeable comparison strategies chained for resilience against LLM response variance.
+
+6. Decorator/Cross-cutting Rule — RetryRule implements TestRule (JUnit4)
+- Wraps test execution to retry flaky UI tests N times, with screenshot capture happening transparently inside cleanup() on each failed attempt.
+- Mapping: cross-cutting reliability concern (flake tolerance) injected via a rule, not scattered try/catch in each test.
+
+7. Facade — RestTableClient, ConversationUtils, ScriptRunner
+- RestTableClient wraps ServiceNow Table API REST calls into insertRecord()/upsertRecord(); ConversationUtils POSTs a sys_trigger script to fault conversations server-side when a business rule blocks direct state change; ScriptRunner executes arbitrary server scripts.
+- Mapping: these are escape hatches from the UI-only test model into direct server-side control — used when POM/driver paths can't reach a required state (e.g., blocked by ACL/business rule).
+
+System-level view: the suite is a layered POM architecture — IOGConstants (config/selectors) → Page Objects (OGWebPage/subclasses + panel/message objects) → Test Base (OffglideTestBase template) → Test Classes (*IT.java), with two side-channels for state manipulation the UI can't reach: **Record Drivers** (GlideRecord) and **REST/Script utilities** (RestTableClient, ConversationUtils, ScriptRunner). Response correctness is decoupled via the Strategy-pattern SimilaritySkill, and flake tolerance is injected via RetryRule`.
