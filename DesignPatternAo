@@ -1,0 +1,49 @@
+his project (Nebula/DARE — agent-orchestrator-v2) is built on two layered design patterns:
+
+1. Pipeline/Stage architecture (5 layers)
+- I/O & Integration → Execution (Runtime) → Flow Orchestration → State Management → REST API
+- Each conversation turn moves through discrete pipeline_stages/ (START, PLANNER1_COMBINED, PLANNER2, DATA_COLLECTOR, OPENAI_TOOL_EXECUTION, FINISH, etc.), each with its own preprocessor → LLM call → postprocessor, mirroring a classic pipe-and-filter pattern. ExecutionFlowManager acts as the router/state machine deciding the next stage based on ResponseClass (e.g., SINGLE_AGENT_TOOL_MATCH → OPENAI_AGENT_EXECUTION).
+
+2. DARE's 6 first principles (the higher-level architectural philosophy layered on top of the pipeline):
+1. Guidance-driven, not rule-driven — stateless core loop, behavior via callbacks
+2. Minimal, composable tool set — small core primitives, domain tools discovered/deferred (MCP, skills)
+3. Effective context engineering — progressive disclosure, VFS as external memory, compaction
+4. Trajectory guidance without overriding — <system-reminder> injection nudges rather than directs
+5. Cache-first architecture — byte-stable system prompt, append-only STM
+6. Tool descriptions as contracts — declarative "what/when," no embedded control flow
+
+
+
+Supporting patterns: factory (state_management/factories/) for task/plan creation, repository (state_management/repositories/) for persistence, and a feature-group registry (dare/features.py) as single source of truth for toggles/tools/context sections.
+
+Mapping the architecture onto textbook system-design vocabulary:
+
+Separation of concerns / layered architecture
+The 5-layer split (I/O → Execution → Flow Orchestration → State Management → REST API) is a classic layered architecture — each layer only talks to the one below it, so you can swap the LLM provider or the transport (SSE) without touching state logic.
+
+Pipe-and-filter / Chain of Responsibility
+pipeline_stages/ is a pipe-and-filter pipeline: each stage transforms ExecutionContext and hands off to the next. ExecutionFlowManager.determine_next_action() is the dispatcher, functioning like Chain of Responsibility with dynamic routing based on ResponseClass rather than a fixed chain.
+
+Finite State Machine
+ExecutionPlan (READY → IN_PROGRESS → SUSPENDED/COMPLETED/TERMINATED/ABANDONED) and ExecutionTask (QUEUED → READY → ONGOING → SUCCESS/ERROR/CANCELLED) are textbook FSMs — this is how the system tracks partial progress across async, interruptible, multi-turn work.
+
+Producer-consumer / async messaging
+The SSE queue decouples the pipeline executor (producer, background task) from the HTTP response stream (consumer). This is the same pattern as a message queue — it's why interrupts and cancellation (27-interrupt-stop-mechanism) need explicit checkpoints rather than just killing a thread.
+
+Factory + Repository
+execution_task_factory.py (Factory) creates tasks with correct defaults/order; state_management/repositories/ (Repository) abstracts persistence so business logic doesn't know if it's talking to Glide or a cache.
+
+Cache-first / CQRS-adjacent
+Principle 5 (byte-stable system prompt, append-only STM, never mutate history) is the LLM-context equivalent of immutable event sourcing — you never rewrite the log, you only append and periodically compact (snapshot), which is exactly how event-sourced systems handle unbounded history.
+
+Circuit breaker
+Compaction has an explicit circuit breaker (09-compaction.md) — if compaction fails repeatedly, it trips rather than retrying indefinitely, same intent as Netflix Hystrix-style breakers for failing dependencies.
+
+Strategy pattern
+Tool execution handlers (regular, skill, widget, builtin, async in tool_execution_handlers/) are interchangeable strategies selected at dispatch time based on tool type.
+
+Feature flags as a registry, not scattered booleans
+FEATURE_GROUPS in features.py centralizes toggle → tools/context/nudges mapping — a single source of truth rather than the anti-pattern of flags sprinkled through business logic, which is what makes step 4 of the "adding a feature" checklist ("tool filtering is automatic") actually hold.
+
+Stateless core + externalized state = horizontal scalability
+Principle 1 keeps the agent loop stateless; all durable state lives in StateManager/cache/Glide. This is the standard "stateless service tier + external state store" pattern that lets pods scale horizontally without sticky sessions — consistent with the Docker/pod-based deployment in the setup docs.
